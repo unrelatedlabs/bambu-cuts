@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bambucuts"
+version = "0.1.0"
+description = "Cutter and Plotter control for Bambu Lab 3D Printers"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Pero"}
+]
+keywords = ["bambu", "cnc", "plotter", "gcode", "3d-printer"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Manufacturing",
+    "Topic :: System :: Hardware",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+    "flask>=2.0.0",
+    "flask-cors>=3.0.0",
+    "flask-socketio>=5.0.0",
+    "bambulabs_api",
+    "svgpathtools",
+    "shapely",
+    "ezdxf",
+    "cairosvg",
+    "svg-to-gcode>=1.5.0",
+    "numpy",
+]
+
+[project.scripts]
+bambucuts = "bambucuts.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/yourusername/bambucuts"
+Repository = "https://github.com/yourusername/bambucuts"
+
+[tool.setuptools]
+packages = ["bambucuts", "bambucuts.webui"]
+
+[tool.setuptools.package-data]
+bambucuts = ["template.3mf"]
+"bambucuts.webui" = ["static/**/*", "templates/**/*"]

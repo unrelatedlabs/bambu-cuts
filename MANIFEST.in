@@ -1,0 +1,6 @@
+include README.md
+include LICENSE
+include requirements.txt
+recursive-include bambucuts *.3mf
+recursive-include bambucuts/webui/static *
+recursive-include bambucuts/webui/templates *

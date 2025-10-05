@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>✂️ Bambu Cuts</title>
+    <link rel="stylesheet" href="/static/style.css?v=3">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>✂️ Bambu Cuts - Cutter and Plotter ✂️</h1>
+        </header>
+
+        <!-- Connection Status & Configuration -->
+        <section class="status-section">
+            <div class="status-config-container">
+                <!-- Connection Status -->
+                <div class="status-box" id="connectionStatus">
+                    <span id="statusText">Printer: DISCONNECTED</span>
+                    <button id="connectBtn" class="btn btn-primary">Connect</button>
+                </div>
+
+                <!-- Configuration Fields -->
+                <div class="config-box">
+                    <div class="config-field">
+                        <label>IP Address:</label>
+                        <input type="text" id="printerIP" placeholder="192.168.1.150" value="">
+                    </div>
+                    <div class="config-field">
+                        <label>Serial:</label>
+                        <input type="text" id="printerSerial" placeholder="Serial Number" value="">
+                    </div>
+                    <div class="config-field">
+                        <label>Access Code:</label>
+                        <input type="text" id="printerAccessCode" placeholder="Access Code" value="">
+                    </div>
+                    <button id="saveConfigBtn" class="btn btn-secondary">Save Config</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- Two Column Layout -->
+        <div class="two-column-layout">
+            <!-- Left Column: Jogger -->
+            <div class="left-column">
+                <!-- Unified Control Panel -->
+                <section class="unified-control-section">
+                    <h2>🎯 Jog Controls</h2>
+
+                    <div class="unified-control">
+                        <!-- XY D-pad with concentric rings -->
+                        <div class="xy-control">
+                            <div class="control-label">🕹 XY</div>
+                            <div class="dpad-ring-container">
+                                <!-- Outer ring: 10mm -->
+                                <button class="dpad-ring-btn ring-outer ring-up" data-axis="y" data-dir="1" data-step="10">▲<br>10</button>
+                                <button class="dpad-ring-btn ring-outer ring-left" data-axis="x" data-dir="-1" data-step="10">◀<br>10</button>
+                                <button class="dpad-ring-btn ring-outer ring-right" data-axis="x" data-dir="1" data-step="10">▶<br>10</button>
+                                <button class="dpad-ring-btn ring-outer ring-down" data-axis="y" data-dir="-1" data-step="10">▼<br>10</button>
+
+                                <!-- Middle ring: 1mm -->
+                                <button class="dpad-ring-btn ring-middle ring-up" data-axis="y" data-dir="1" data-step="1">▲<br>1</button>
+                                <button class="dpad-ring-btn ring-middle ring-left" data-axis="x" data-dir="-1" data-step="1">◀<br>1</button>
+                                <button class="dpad-ring-btn ring-middle ring-right" data-axis="x" data-dir="1" data-step="1">▶<br>1</button>
+                                <button class="dpad-ring-btn ring-middle ring-down" data-axis="y" data-dir="-1" data-step="1">▼<br>1</button>
+
+                                <!-- Inner ring: 0.1mm -->
+                                <button class="dpad-ring-btn ring-inner ring-up" data-axis="y" data-dir="1" data-step="0.1">▲<br>0.1</button>
+                                <button class="dpad-ring-btn ring-inner ring-left" data-axis="x" data-dir="-1" data-step="0.1">◀<br>0.1</button>
+                                <button class="dpad-ring-btn ring-inner ring-right" data-axis="x" data-dir="1" data-step="0.1">▶<br>0.1</button>
+                                <button class="dpad-ring-btn ring-inner ring-down" data-axis="y" data-dir="-1" data-step="0.1">▼<br>0.1</button>
+
+                                <!-- Center home indicator -->
+                                <div class="dpad-center-icon">🏠</div>
+                            </div>
+                            <div class="keyboard-hint-compact">Arrows (Shift=10x fine)</div>
+                        </div>
+
+                        <!-- Z Control -->
+                        <div class="z-control">
+                            <div class="control-label">🎚 Z</div>
+                            <div class="axis-control-unified">
+                                <button class="axis-btn-unified top" data-axis="z" data-dir="1" data-step="10">Z+ 10</button>
+                                <button class="axis-btn-unified" data-axis="z" data-dir="1" data-step="1">Z+ 1</button>
+                                <button class="axis-btn-unified" data-axis="z" data-dir="1" data-step="0.1">Z+ 0.1</button>
+                                <button class="axis-btn-unified finest" data-axis="z" data-dir="1" data-step="0.02">Z+ 0.02</button>
+                                <button class="axis-btn-unified finest" data-axis="z" data-dir="-1" data-step="0.02">Z- 0.02</button>
+                                <button class="axis-btn-unified" data-axis="z" data-dir="-1" data-step="0.1">Z- 0.1</button>
+                                <button class="axis-btn-unified" data-axis="z" data-dir="-1" data-step="1">Z- 1</button>
+                                <button class="axis-btn-unified bottom" data-axis="z" data-dir="-1" data-step="10">Z- 10</button>
+                            </div>
+                            <div class="keyboard-hint-compact">U/J</div>
+                        </div>
+
+                        <!-- E Control -->
+                        <div class="e-control">
+                            <div class="control-label">🌀 E</div>
+                            <div class="axis-control-unified">
+                                <button class="axis-btn-unified top" data-axis="e" data-dir="1" data-step="1">E+ 1</button>
+                                <button class="axis-btn-unified" data-axis="e" data-dir="1" data-step="0.5">E+ 0.5</button>
+                                <button class="axis-btn-unified" data-axis="e" data-dir="-1" data-step="0.5">E- 0.5</button>
+                                <button class="axis-btn-unified bottom" data-axis="e" data-dir="-1" data-step="1">E- 1</button>
+                            </div>
+                            <div class="keyboard-hint-compact">E/D</div>
+                        </div>
+                    </div>
+
+                    <!-- Z Movement Subsection -->
+                    <div class="jogger-subsection">
+                        <h3>📏 Z Positioning</h3>
+                        <div class="button-grid-compact-4col">
+                            <button class="btn btn-special" id="moveZ0">0mm</button>
+                            <button class="btn btn-special" id="moveZ10">10mm</button>
+                            <button class="btn btn-special" id="moveZ50">50mm</button>
+                            <button class="btn btn-special" id="moveZ100">100mm</button>
+                        </div>
+                    </div>
+
+                    <!-- Kiss Subsection -->
+                    <div class="jogger-subsection">
+                        <h3>💋 Kiss Functions</h3>
+                        <div class="button-grid-compact-2col">
+                            <button class="btn btn-special" id="kissZ">Kiss Z (K)</button>
+                            <button class="btn btn-special" id="microKissZ">Micro Kiss (Shift+K)</button>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Homing -->
+                <section class="special-section">
+                    <h2>🏠 Homing</h2>
+                    <div class="button-grid">
+                        <button class="btn btn-special" id="homeXY">Home XY</button>
+                        <button class="btn btn-special" id="saveZ">Set Z=0</button>
+                        <button class="btn btn-special" id="resetE">Set E=0</button>
+                    </div>
+                </section>
+
+                <!-- Manual G-code Input -->
+                <section class="gcode-section">
+                    <h2>⌨️ Manual G-code Input</h2>
+                    <div class="gcode-input-container">
+                        <input type="text" id="gcodeInput" placeholder="Enter G-code command (e.g., G1 X10 Y20)">
+                        <button class="btn btn-primary" id="sendGcode">Send</button>
+                    </div>
+                </section>
+
+                <!-- G-code History -->
+                <section class="history-section">
+                    <h2>📝 G-code History</h2>
+                    <div class="history-container" id="gcodeHistory">
+                        <div class="history-empty">No commands sent yet</div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Right Column: G-code Editor -->
+            <div class="right-column">
+                <section class="editor-section">
+                    <div class="editor-header">
+                        <h2>📄 G-code Editor</h2>
+                        <div class="editor-actions">
+                            <button class="btn btn-secondary" id="loadFileBtn">Load File</button>
+                            <button class="btn btn-secondary" id="saveFileBtn">Save File</button>
+                            <button class="btn btn-primary" id="sendAllBtn">Print 3MF</button>
+                            <button class="btn btn-primary" id="sendDirectBtn">Print Direct</button>
+                            <button class="btn btn-secondary" id="download3mfBtn">Download 3MF</button>
+                        </div>
+                    </div>
+
+                    <div class="editor-info">
+                        <label>Filename:</label>
+                        <input type="text" id="fileName" value="Untitled.gcode">
+                    </div>
+
+                    <div class="editor-wrapper">
+                        <div id="lineNumbers" class="line-numbers"></div>
+                        <textarea id="gcodeEditor" class="gcode-editor" placeholder="Enter or paste G-code here...
+Example:
+G28 X Y      ; Home XY axes
+G1 Z10 F600  ; Move Z to 10mm
+G1 X50 Y50 F1000  ; Move to position"></textarea>
+                    </div>
+
+                    <div class="editor-controls">
+                        <span class="editor-hint">💡 Drag & drop .gcode files here to load</span>
+                    </div>
+                </section>
+
+                <!-- SVG/DXF Converter Section -->
+                <section class="converter-section">
+                    <h2>🔄 SVG/DXF to G-code Converter</h2>
+                    <div class="converter-dropzone" id="converterDropzone">
+                        <div class="dropzone-content">
+                            <span class="dropzone-icon">📁</span>
+                            <span class="dropzone-text">Drop SVG or DXF file here</span>
+                            <span class="dropzone-subtext">or click to browse</span>
+                        </div>
+                        <input type="file" id="converterFileInput" accept=".svg,.dxf" style="display: none;">
+                    </div>
+                    <div class="converter-status" id="converterStatus"></div>
+                </section>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js?v=4"></script>
+</body>
+</html>

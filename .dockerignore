@@ -1,0 +1,39 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.claude/
+.DS_Store
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Documentation
+README.md
+*.md
+
+# Test files
+test_*/
+*_test.py
+badge*.svg
+badge*.gcode
+*.3mf
+Untitled*/
+
+# Config
+.bambucuts.conf

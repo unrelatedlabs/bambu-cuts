@@ -31,13 +31,18 @@ except ImportError:
     print("Error: svg-to-gcode package not found. Please install it with: pip install svg-to-gcode")
     sys.exit(1)
 
+# Import our custom SVG path joiner
+try:
+    from bambucuts.svg_path_joiner import SVGPathJoinerRemoveMRegex
+except ImportError:
+    from svg_path_joiner import SVGPathJoinerRemoveMRegex
+
 
 @dataclass
 class CuttingParameters:
     """Configuration parameters for cutting operations."""
-    material_thickness: float = 1.0  # mm
-    cut_depth_per_pass: float = 0.2  # mm
-    number_of_passes: int = 5
+    material_thickness: float = 0.2  # mm
+    number_of_passes: int = 1
     knife_force: float = 100.0  # grams
     movement_speed: float = 10000.0  # mm/min
     cutting_speed: float = 1000.0  # mm/min
@@ -47,6 +52,11 @@ class CuttingParameters:
     path_tolerance: float = 0.1  # mm tolerance for considering paths as connected
     swivel_sensitivity: float = 0.6  # Swivel sensitivity (0.0 = no swivel, 1.0 = full swivel)
     sharp_corner_threshold: float = 45.0  # Degrees - threshold for sharp corner handling
+    origin_top_left: bool = True  # Set origin at top left of graphics (default: True)
+    mirror_x: bool = False  # Mirror the X-axis (flip horizontally)
+    mirror_y: bool = False  # Mirror the Y-axis (flip vertically)
+    z_offset: float = 0  # mm Z offset to add to all Z movements (positive = higher, negative = lower)
+    z_safe_height: float = None  # mm safe Z height (defaults to material_thickness + 2 + z_offset)
 
 
 @dataclass
@@ -290,14 +300,15 @@ class KnifeOffsetCompensator:
 
 
 class PathJoiner:
-    """Handles joining of connected SVG paths to minimize tool lifts."""
+    """Handles joining of connected SVG paths to minimize tool lifts using our custom joiner."""
     
     def __init__(self, tolerance: float = 0.1):
         self.tolerance = tolerance
+        self.svg_joiner = SVGPathJoinerRemoveMRegex(tolerance=tolerance)
         
     def join_paths(self, curves) -> List:
         """
-        Join connected paths to minimize tool lifts.
+        Join connected paths to minimize tool lifts using our custom SVG path joiner.
         
         Args:
             curves: List of SVG curves/paths
@@ -307,134 +318,11 @@ class PathJoiner:
         """
         if not curves:
             return curves
-            
-        # Extract points from curves
-        path_data = []
-        for i, curve in enumerate(curves):
-            if hasattr(curve, 'points') and curve.points:
-                points = [(p.x, p.y) for p in curve.points]
-                path_data.append({
-                    'index': i,
-                    'points': points,
-                    'start': points[0] if points else None,
-                    'end': points[-1] if points else None,
-                    'used': False
-                })
         
-        if not path_data:
-            return curves
-            
-        # Join paths that connect end-to-end
-        joined_paths = []
-        remaining_paths = path_data.copy()
-        
-        while remaining_paths:
-            current_path = remaining_paths.pop(0)
-            if current_path['used']:
-                continue
-                
-            current_path['used'] = True
-            joined_path = current_path['points'].copy()
-            
-            # Try to find connected paths
-            while True:
-                found_connection = False
-                
-                for i, other_path in enumerate(remaining_paths):
-                    if other_path['used']:
-                        continue
-                        
-                    # Check if paths connect
-                    connection_type = self._check_connection(
-                        current_path['end'], 
-                        other_path['start'], 
-                        other_path['end']
-                    )
-                    
-                    if connection_type:
-                        other_path['used'] = True
-                        remaining_paths.pop(i)
-                        
-                        if connection_type == 'end_to_start':
-                            # Add other path to current path
-                            joined_path.extend(other_path['points'][1:])  # Skip first point (duplicate)
-                        elif connection_type == 'end_to_end':
-                            # Add reversed other path to current path
-                            reversed_points = other_path['points'][::-1]
-                            joined_path.extend(reversed_points[1:])  # Skip first point (duplicate)
-                        elif connection_type == 'start_to_start':
-                            # Add reversed current path, then other path
-                            joined_path = joined_path[::-1]
-                            joined_path.extend(other_path['points'][1:])
-                        elif connection_type == 'start_to_end':
-                            # Add other path to current path
-                            joined_path.extend(other_path['points'][1:])
-                        
-                        # Update current path end point
-                        current_path['end'] = joined_path[-1]
-                        found_connection = True
-                        break
-                
-                if not found_connection:
-                    break
-            
-            # Create new curve with joined path
-            joined_curve = self._create_curve_from_points(joined_path, current_path['index'])
-            joined_paths.append(joined_curve)
-        
-        return joined_paths
-    
-    def _check_connection(self, end1: Tuple[float, float], 
-                         start2: Tuple[float, float], 
-                         end2: Tuple[float, float]) -> Optional[str]:
-        """
-        Check if two paths connect and return connection type.
-        
-        Returns:
-            'end_to_start', 'end_to_end', 'start_to_start', 'start_to_end', or None
-        """
-        if not end1 or not start2 or not end2:
-            return None
-            
-        # Check end-to-start connection
-        if self._points_close(end1, start2):
-            return 'end_to_start'
-            
-        # Check end-to-end connection
-        if self._points_close(end1, end2):
-            return 'end_to_end'
-            
-        # Check start-to-start connection
-        if self._points_close(end1, start2):
-            return 'start_to_start'
-            
-        # Check start-to-end connection
-        if self._points_close(end1, end2):
-            return 'start_to_end'
-            
-        return None
-    
-    def _points_close(self, p1: Tuple[float, float], p2: Tuple[float, float]) -> bool:
-        """Check if two points are close enough to be considered connected."""
-        if not p1 or not p2:
-            return False
-        distance = math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
-        return distance <= self.tolerance
-    
-    def _create_curve_from_points(self, points: List[Tuple[float, float]], original_index: int):
-        """
-        Create a curve object from a list of points.
-        This is a simplified implementation - in practice, you'd need
-        to create the appropriate curve type based on the original curve.
-        """
-        # For now, return a simple line curve
-        # In a real implementation, you'd need to handle different curve types
-        class SimpleCurve:
-            def __init__(self, points):
-                self.points = points
-                self.original_index = original_index
-                
-        return SimpleCurve(points)
+        # For now, return the original curves as our joiner works on SVG files
+        # In a future enhancement, we could integrate the joiner more directly
+        # with the curve objects, but for now we'll rely on the SVG file processing
+        return curves
 
 
 class KnifeInterface(interfaces.Gcode):
@@ -448,16 +336,26 @@ class KnifeInterface(interfaces.Gcode):
         self.is_cutting = False
         self.last_position = None
         self.path_joiner = None
+        self.svg_bounds = None  # Will store SVG bounds for coordinate transformation
+        self.pass_depth = 0.0  # Will be set by the compiler for each pass
         
     def laser_off(self):
         """Turn off cutting (retract knife)."""
         self.is_cutting = False
-        return f"G1 Z{self.params.material_thickness + 2} F{self.params.movement_speed}"
+        # Use custom safe height if specified, otherwise calculate from material thickness
+        if self.params.z_safe_height is not None:
+            safe_z = self.params.z_safe_height
+        else:
+            safe_z = self.params.material_thickness + 2
+        return f"G1 Z{safe_z} F{self.params.movement_speed}"
     
     def laser_on(self):
         """Turn on cutting (engage knife)."""
         self.is_cutting = True
-        return f"G1 Z{self.params.material_thickness - self.params.cut_depth_per_pass} F{self.params.cutting_speed}"
+        # Use the pass_depth that was set by the compiler
+        # This will be the correct depth for the current pass
+        cut_z = self.params.material_thickness - self.pass_depth
+        return f"G1 Z{cut_z} F{self.params.cutting_speed}"
     
     def set_laser_power(self, power):
         """Set cutting power (0 = off, 1 = on)."""
@@ -475,12 +373,55 @@ class KnifeInterface(interfaces.Gcode):
     
     def rapid_move(self, x, y):
         """Rapid positioning move."""
-        return f"G0 X{x} Y{y} F{self.params.movement_speed}"
+        # Apply coordinate transformation if needed
+        transformed_x, transformed_y = self.transform_coordinates(x, y)
+        return f"G0 X{transformed_x} Y{transformed_y} F{self.params.movement_speed}"
     
     def linear_move(self, x, y):
         """Linear cutting move."""
+        # Apply coordinate transformation if needed
+        transformed_x, transformed_y = self.transform_coordinates(x, y)
         speed = self.params.cutting_speed if self.is_cutting else self.params.movement_speed
-        return f"G1 X{x} Y{y} F{speed}"
+        return f"G1 X{transformed_x} Y{transformed_y} F{speed}"
+    
+    def set_svg_bounds(self, min_x, min_y, max_x, max_y):
+        """Set SVG bounds for coordinate transformation."""
+        self.svg_bounds = (min_x, min_y, max_x, max_y)
+    
+    def transform_coordinates(self, x, y):
+        """Transform coordinates based on origin setting and mirroring options."""
+        if not self.params.origin_top_left or not self.svg_bounds:
+            return x, y
+        
+        min_x, min_y, max_x, max_y = self.svg_bounds
+        
+        # For top-left origin: offset so graphics content starts at (0,0)
+        # and flip Y-axis so top-left becomes (0,0) in G-code
+        offset_x = x - min_x
+        offset_y = y - min_y
+        
+        # Flip Y-axis: in SVG, Y increases downward, in G-code Y increases upward
+        # So we need to flip around the content height
+        content_height = max_y - min_y
+        flipped_y = content_height - offset_y
+        
+        # Apply mirroring if requested
+        if self.params.mirror_x:
+            content_width = max_x - min_x
+            offset_x = content_width - offset_x
+        
+        if self.params.mirror_y:
+            flipped_y = content_height - flipped_y
+        
+        return offset_x, flipped_y
+    
+    def get_origin_setting_command(self):
+        """Get G92 command to set origin to current position."""
+        return "G92 X0 Y0 ; Set current position as origin"
+    
+    def get_home_command(self):
+        """Get command to move toolhead back to origin (0,0) with Z lift."""
+        return "G0 Z50 ; Lift to safe height\nG0 X0 Y0 ; Move back to origin"
 
 
 class GCodeTools:
@@ -494,6 +435,160 @@ class GCodeTools:
             corner_loop_radius=self.params.corner_loop_radius
         )
         self.path_joiner = PathJoiner(tolerance=self.params.path_tolerance)
+    
+    def _calculate_svg_bounds(self, svg_path: str) -> Tuple[float, float, float, float]:
+        """Calculate SVG bounds (min_x, min_y, max_x, max_y) from actual graphics content."""
+        try:
+            # Parse SVG to get bounds
+            tree = ET.parse(svg_path)
+            root = tree.getroot()
+            
+            # For top-left origin, we want to find the actual bounds of the graphics content
+            # and position them so the top-left of the content is at (0,0)
+            if self.params.origin_top_left:
+                # Use the svg-to-gcode parser to get the actual curve bounds
+                curves = parse_file(svg_path)
+                
+                if curves:
+                    # Find bounds of all curves
+                    all_x = []
+                    all_y = []
+                    
+                    for curve in curves:
+                        # Extract points from curve (this is a simplified approach)
+                        # In practice, you'd need to properly extract all points from the curve
+                        if hasattr(curve, 'points'):
+                            for point in curve.points:
+                                all_x.append(point.x)
+                                all_y.append(point.y)
+                        elif hasattr(curve, 'start') and hasattr(curve, 'end'):
+                            all_x.extend([curve.start.x, curve.end.x])
+                            all_y.extend([curve.start.y, curve.end.y])
+                    
+                    if all_x and all_y:
+                        min_x, max_x = min(all_x), max(all_x)
+                        min_y, max_y = min(all_y), max(all_y)
+                        return min_x, min_y, max_x, max_y
+            
+            # Fallback to viewBox if curve parsing fails
+            viewbox = root.get('viewBox')
+            if viewbox:
+                parts = viewbox.split()
+                if len(parts) >= 4:
+                    min_x, min_y, width, height = map(float, parts[:4])
+                    return min_x, min_y, min_x + width, min_y + height
+            
+            # If no viewBox, try to calculate from content
+            width = float(root.get('width', '100'))
+            height = float(root.get('height', '100'))
+            return 0, 0, width, height
+            
+        except Exception as e:
+            print(f"Warning: Could not calculate SVG bounds: {e}")
+            return 0, 0, 100, 100  # Default bounds
+    
+    def _add_origin_setting(self, gcode_content: str, origin_command: str) -> str:
+        """Add origin setting command at the beginning of G-code."""
+        lines = gcode_content.split('\n')
+        
+        # Find the first non-comment, non-empty line to insert after
+        insert_index = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped and not stripped.startswith(';'):
+                insert_index = i
+                break
+        
+        # Insert the origin command
+        lines.insert(insert_index, origin_command)
+        
+        return '\n'.join(lines)
+    
+    def _add_home_command(self, gcode_content: str, home_command: str) -> str:
+        """Add home command at the end of G-code (before M2)."""
+        lines = gcode_content.split('\n')
+        
+        # Find the last M2 command or add at the end
+        insert_index = len(lines)
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].strip().startswith('M2'):
+                insert_index = i
+                break
+        
+        # Insert the home command before M2
+        lines.insert(insert_index, home_command)
+        
+        return '\n'.join(lines)
+    
+    def _apply_z_offset(self, gcode_content: str) -> str:
+        """Apply Z offset to all Z movements in the G-code."""
+        if self.params.z_offset == 0:
+            return gcode_content
+        
+        lines = gcode_content.split('\n')
+        processed_lines = []
+        
+        for line in lines:
+            # Check if line contains Z coordinate
+            if 'Z' in line and ('G0' in line or 'G1' in line):
+                # Extract Z value and add offset
+                import re
+                z_match = re.search(r'Z([+-]?\d*\.?\d+)', line)
+                if z_match:
+                    z_value = float(z_match.group(1))
+                    new_z = z_value + self.params.z_offset
+                    # Replace Z value in the line
+                    new_line = re.sub(r'Z[+-]?\d*\.?\d+', f'Z{new_z:.6f}', line)
+                    processed_lines.append(new_line)
+                else:
+                    processed_lines.append(line)
+            else:
+                processed_lines.append(line)
+        
+        return '\n'.join(processed_lines)
+    
+    def _save_joined_paths_svg(self, curves, output_path: str, min_x: float, min_y: float, max_x: float, max_y: float):
+        """Save joined paths as SVG for visualization."""
+        width = max_x - min_x + 20
+        height = max_y - min_y + 20
+        
+        svg_content = f'''<?xml version="1.0" encoding="UTF-8"?>
+<svg width="{width}mm" height="{height}mm" viewBox="{min_x-10} {min_y-10} {width} {height}" 
+     xmlns="http://www.w3.org/2000/svg"
+     xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+     xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd">
+  <title>Joined Paths Visualization</title>
+  
+  <!-- White background -->
+  <rect x="{min_x-10}" y="{min_y-10}" width="{width}" height="{height}" fill="white" stroke="none"/>
+  
+  <!-- Joined paths -->
+  <g stroke="red" stroke-width="0.2" fill="none">
+'''
+        
+        # Draw each joined path
+        for i, curve in enumerate(curves):
+            if hasattr(curve, 'points') and curve.points:
+                # Draw path from points
+                path_data = f"M {curve.points[0].x} {curve.points[0].y}"
+                for point in curve.points[1:]:
+                    path_data += f" L {point.x} {point.y}"
+                
+                svg_content += f'    <path d="{path_data}" stroke="hsl({(i * 137.5) % 360}, 70%, 50%)" stroke-width="0.3"/>\n'
+            elif hasattr(curve, 'start') and hasattr(curve, 'end'):
+                # Draw simple line for start/end curves
+                svg_content += f'    <line x1="{curve.start.x}" y1="{curve.start.y}" x2="{curve.end.x}" y2="{curve.end.y}" stroke="hsl({(i * 137.5) % 360}, 70%, 50%)" stroke-width="0.3"/>\n'
+        
+        svg_content += '''  </g>
+  
+  <!-- Legend -->
+  <g font-family="Arial" font-size="2" fill="black">
+    <text x="10" y="15">Joined Paths (different colors for each path)</text>
+  </g>
+</svg>'''
+        
+        with open(output_path, 'w') as f:
+            f.write(svg_content)
         
     def svg_to_gcode(self, svg_path: str, output_path: str = None) -> str:
         """
@@ -509,56 +604,145 @@ class GCodeTools:
         if not os.path.exists(svg_path):
             raise FileNotFoundError(f"SVG file not found: {svg_path}")
         
-        # Parse SVG file
-        curves = parse_file(svg_path)
-        
-        # Join connected paths if enabled
+        # Join connected paths if enabled using our custom joiner
         if self.params.join_paths:
-            curves = self.path_joiner.join_paths(curves)
+            # Create a temporary joined SVG file
+            temp_svg_path = svg_path.replace('.svg', '_joined_temp.svg')
+            self.path_joiner.svg_joiner.load_svg(svg_path)
+            self.path_joiner.svg_joiner.join_paths()
+            self.path_joiner.svg_joiner.save_svg(temp_svg_path)
+            
+            # Use the joined SVG for processing
+            processing_svg_path = temp_svg_path
+            
+            # Save joined paths as SVG for visualization
+            if output_path:
+                joined_svg_path = output_path.replace('.gcode', '_joined_paths.svg')
+                # Copy the joined SVG to the visualization path
+                import shutil
+                shutil.copy2(temp_svg_path, joined_svg_path)
+                print(f"Joined paths saved to: {joined_svg_path}")
+        else:
+            processing_svg_path = svg_path
+        
+        # Calculate SVG bounds for coordinate transformation
+        min_x, min_y, max_x, max_y = self._calculate_svg_bounds(processing_svg_path)
+        
+        # Parse SVG file
+        curves = parse_file(processing_svg_path)
+        
+        # Clean up temporary file if created
+        if self.params.join_paths and os.path.exists(temp_svg_path):
+            os.remove(temp_svg_path)
         
         # Create compiler with knife interface
+        # Calculate cut depth per pass: material_thickness / number_of_passes
+        cut_depth_per_pass = self.params.material_thickness / self.params.number_of_passes
         compiler = Compiler(
             KnifeInterface, 
             movement_speed=self.params.movement_speed,
             cutting_speed=self.params.cutting_speed,
-            pass_depth=self.params.cut_depth_per_pass
+            pass_depth=cut_depth_per_pass
         )
         
         # Set parameters on the interface
         compiler.interface.params = self.params
         
+        # Set SVG bounds for coordinate transformation
+        compiler.interface.set_svg_bounds(min_x, min_y, max_x, max_y)
+        
         # Note: 2D knife offset will be applied post-processing to G-code
         # for better control over the offset algorithm
         
-        # Compile to G-code
-        compiler.append_curves(curves)
+        # Generate G-code with multiple passes
+        if self.params.number_of_passes > 1:
+            # Generate multiple passes
+            all_passes_gcode = []
+            
+            for pass_num in range(self.params.number_of_passes):
+                # Calculate the Z depth for this pass
+                # Pass 1: material_thickness - cut_depth_per_pass
+                # Pass 2: material_thickness - 2*cut_depth_per_pass
+                # Pass N: material_thickness - N*cut_depth_per_pass
+                pass_cut_depth = cut_depth_per_pass * (pass_num + 1)
+                
+                # Create a new compiler for each pass with the correct cut depth
+                pass_compiler = Compiler(
+                    KnifeInterface, 
+                    movement_speed=self.params.movement_speed,
+                    cutting_speed=self.params.cutting_speed,
+                    pass_depth=pass_cut_depth
+                )
+                
+                # Set parameters on the interface
+                pass_compiler.interface.params = self.params
+                pass_compiler.interface.set_svg_bounds(min_x, min_y, max_x, max_y)
+                pass_compiler.interface.pass_depth = pass_cut_depth
+                
+                # Compile this pass
+                pass_compiler.append_curves(curves)
+                pass_gcode = pass_compiler.compile()
+                
+                # Add pass header
+                pass_header = f"\n; Pass {pass_num + 1} of {self.params.number_of_passes} (cut depth: {pass_cut_depth:.3f}mm)\n"
+                all_passes_gcode.append(pass_header + pass_gcode)
+            
+            # Combine all passes
+            combined_gcode = '\n'.join(all_passes_gcode)
+        else:
+            # Single pass - use original method
+            # Set the pass_depth for single pass
+            compiler.interface.pass_depth = cut_depth_per_pass
+            compiler.append_curves(curves)
+            combined_gcode = compiler.compile()
         
         if output_path:
-            compiler.compile_to_file(output_path)
+            # Write combined G-code to file
+            with open(output_path, 'w') as f:
+                f.write(combined_gcode)
+            
+            # Read it back for processing
             gcode_content = self._read_gcode_file(output_path)
             
-            # Post-process G-code
-            processed_gcode = gcode_content
+            # Add origin setting command at the beginning
+            origin_command = compiler.interface.get_origin_setting_command()
+            processed_gcode = self._add_origin_setting(gcode_content, origin_command)
+            
+            # Add home command at the end
+            home_command = compiler.interface.get_home_command()
+            processed_gcode = self._add_home_command(processed_gcode, home_command)
+            
+            # Apply Z offset to all Z movements
+            processed_gcode = self._apply_z_offset(processed_gcode)
             
             # Apply 2D knife offset compensation if needed
             if self.params.knife_offset != 0:
                         processed_gcode = self._apply_simple_2d_offset(processed_gcode)
-            
-            # Optimize tool lifts if path joining is enabled
-            if self.params.join_paths:
-                processed_gcode = self._optimize_tool_lifts(processed_gcode)
+
+            # Optimize tool lifts (always enabled to remove unnecessary lifts)
+            processed_gcode = self._optimize_tool_lifts(processed_gcode)
             
             with open(output_path, 'w') as f:
                 f.write(processed_gcode)
             return processed_gcode
         else:
             # Return G-code as string
-            gcode_string = compiler.compile()
+            gcode_string = combined_gcode
+            
+            # Add origin setting command at the beginning
+            origin_command = compiler.interface.get_origin_setting_command()
+            gcode_string = self._add_origin_setting(gcode_string, origin_command)
+            
+            # Add home command at the end
+            home_command = compiler.interface.get_home_command()
+            gcode_string = self._add_home_command(gcode_string, home_command)
+            
+            # Apply Z offset to all Z movements
+            gcode_string = self._apply_z_offset(gcode_string)
             
             # Post-process G-code
-            # Optimize tool lifts if path joining is enabled
-            if self.params.join_paths:
-                gcode_string = self._optimize_tool_lifts(gcode_string)
+            # Optimize tool lifts (always enabled to remove unnecessary lifts)
+            gcode_string = self._optimize_tool_lifts(gcode_string)
             
             return gcode_string
     
@@ -677,6 +861,9 @@ class GCodeTools:
      xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd">
   <title>G-code Visualization</title>
   
+  <!-- White background -->
+  <rect x="{min_x-10}" y="{min_y-10}" width="{width}" height="{height}" fill="white" stroke="none"/>
+  
   <!-- Tool moves (rapid positioning) -->
   <g stroke="blue" stroke-width="0.1" fill="none" stroke-dasharray="2,1">
 '''
@@ -782,50 +969,92 @@ class GCodeTools:
     
     def _optimize_tool_lifts(self, gcode_content: str) -> str:
         """
-        Optimize G-code by removing unnecessary tool lifts between connected segments.
-        
-        This method analyzes the G-code and removes tool lifts (Z movements) when
-        the next cutting move starts at the same position where the previous one ended.
+        Optimize G-code by removing unnecessary tool lifts between connected segments
+        and fixing knife-down positioning issues.
+
+        This method analyzes the G-code and:
+        1. Removes tool lifts when the next cutting move starts at the same position
+        2. Fixes cases where knife is lowered at wrong position before first cut
         """
         lines = gcode_content.split('\n')
         optimized_lines = []
         i = 0
         last_cutting_position = None
-        
+
         while i < len(lines):
             line = lines[i].strip()
-            
+
             # Look for the pattern: Z lift -> rapid move to same position -> Z lower
-            if (line.startswith('G1 Z') and 'F' in line and 
+            if (line.startswith('G1 Z') and 'F' in line and
                 i + 2 < len(lines)):
-                
+
                 next_line = lines[i + 1].strip()
                 third_line = lines[i + 2].strip()
-                
+
                 # Check if next line is a rapid move and third line is Z lower
                 if (next_line.startswith('G1 X') and 'F' in next_line and
                     third_line.startswith('G1 Z') and 'F' in third_line):
-                    
+
                     # Extract positions
                     rapid_pos = self._extract_position_from_line(next_line)
-                    
+
                     # Check if rapid move goes to same position as last cutting position
-                    if (last_cutting_position and rapid_pos and 
+                    if (last_cutting_position and rapid_pos and
                         self._positions_close(last_cutting_position, rapid_pos, self.params.path_tolerance)):
-                        
+
                         # Skip the tool lift and rapid move, go directly to cutting
                         optimized_lines.append(third_line)  # Keep the Z lower and cutting move
                         i += 3  # Skip the lift, rapid move, and Z lower
                         continue
-            
+
             # Track cutting positions
             if line.startswith('G1 X') and 'F' in line and not line.startswith('G1 Z'):
                 last_cutting_position = self._extract_position_from_line(line)
-            
+
             optimized_lines.append(line)
             i += 1
-        
-        return '\n'.join(optimized_lines)
+
+        # Second pass: remove redundant Z commands by tracking current Z position
+        final_lines = []
+        current_z = None
+        for line in optimized_lines:
+            # Check if this is a Z command
+            if line.startswith('G1 Z') or line.startswith('G0 Z'):
+                # Extract Z value
+                z_match = re.search(r'Z([+-]?\d*\.?\d+)', line)
+                if z_match:
+                    z_value = float(z_match.group(1))
+                    # Skip if already at this Z position
+                    if current_z is not None and abs(z_value - current_z) < 0.001:
+                        continue
+                    current_z = z_value
+
+            final_lines.append(line)
+
+        # Third pass: clean up scientific notation and near-zero values
+        cleaned_lines = []
+        for line in final_lines:
+            # Replace scientific notation and round near-zero values
+            if 'X' in line or 'Y' in line:
+                # Extract and clean X coordinate
+                x_match = re.search(r'X([+-]?[\d\.eE\-+]+)', line)
+                if x_match:
+                    x_val = float(x_match.group(1))
+                    if abs(x_val) < 1e-10:  # Essentially zero
+                        x_val = 0.0
+                    line = re.sub(r'X[+-]?[\d\.eE\-+]+', f'X{x_val:.6f}', line)
+
+                # Extract and clean Y coordinate
+                y_match = re.search(r'Y([+-]?[\d\.eE\-+]+)', line)
+                if y_match:
+                    y_val = float(y_match.group(1))
+                    if abs(y_val) < 1e-10:  # Essentially zero
+                        y_val = 0.0
+                    line = re.sub(r'Y[+-]?[\d\.eE\-+]+', f'Y{y_val:.6f}', line)
+
+            cleaned_lines.append(line)
+
+        return '\n'.join(cleaned_lines)
     
     def _extract_position_from_line(self, line: str) -> Optional[Tuple[float, float]]:
         """Extract X, Y position from a G-code line."""
@@ -1321,17 +1550,22 @@ def main():
     svg_to_gcode_parser = subparsers.add_parser('svg-to-gcode', help='Convert SVG to G-code')
     svg_to_gcode_parser.add_argument('input_svg', help='Input SVG file')
     svg_to_gcode_parser.add_argument('-o', '--output', help='Output G-code file')
-    svg_to_gcode_parser.add_argument('--material-thickness', type=float, default=1.0, help='Material thickness (mm)')
-    svg_to_gcode_parser.add_argument('--cut-depth', type=float, default=0.2, help='Cut depth per pass (mm)')
-    svg_to_gcode_parser.add_argument('--passes', type=int, default=5, help='Number of passes')
+    svg_to_gcode_parser.add_argument('--material-thickness', type=float, default=0.1, help='Material thickness (mm)')
+    svg_to_gcode_parser.add_argument('--passes', type=int, default=1, help='Number of passes (each pass cuts material_thickness/passes deep)')
     svg_to_gcode_parser.add_argument('--knife-force', type=float, default=100.0, help='Knife force (grams)')
     svg_to_gcode_parser.add_argument('--knife-offset', type=float, default=0.0, help='Knife blade trailing offset (mm)')
     svg_to_gcode_parser.add_argument('--corner-loop-radius', type=float, default=None, help='Corner loop radius (mm, defaults to 2x knife offset)')
-    svg_to_gcode_parser.add_argument('--join-paths', action='store_true', default=True, help='Join connected paths to minimize tool lifts')
+    svg_to_gcode_parser.add_argument('--join-paths', action='store_true', default=False, help='Join connected paths to minimize tool lifts')
     svg_to_gcode_parser.add_argument('--no-join-paths', action='store_false', dest='join_paths', help='Disable path joining')
     svg_to_gcode_parser.add_argument('--path-tolerance', type=float, default=0.1, help='Tolerance for considering paths as connected (mm)')
-    svg_to_gcode_parser.add_argument('--movement-speed', type=float, default=10000.0, help='Movement speed (mm/min)')
-    svg_to_gcode_parser.add_argument('--cutting-speed', type=float, default=1000.0, help='Cutting speed (mm/min)')
+    svg_to_gcode_parser.add_argument('--movement-speed', type=float, default=1000.0, help='Movement speed (mm/min)')
+    svg_to_gcode_parser.add_argument('--cutting-speed', type=float, default=300.0, help='Cutting speed (mm/min)')
+    svg_to_gcode_parser.add_argument('--origin-top-left', action='store_true', default=True, help='Set origin at top left of graphics (default: True)')
+    svg_to_gcode_parser.add_argument('--no-origin-top-left', action='store_false', dest='origin_top_left', help='Use bottom left origin instead')
+    svg_to_gcode_parser.add_argument('--mirror-x', action='store_true', help='Mirror the X-axis (flip horizontally)')
+    svg_to_gcode_parser.add_argument('--mirror-y', action='store_true', help='Mirror the Y-axis (flip vertically)')
+    svg_to_gcode_parser.add_argument('--z-offset', type=float, default=0.0, help='Z offset to add to all Z movements (mm, positive=higher, negative=lower)')
+    svg_to_gcode_parser.add_argument('--z-safe-height', type=float, default=None, help='Custom safe Z height (mm, overrides material thickness calculation)')
     
     # G-code to SVG command
     gcode_to_svg_parser = subparsers.add_parser('gcode-to-svg', help='Convert G-code to SVG visualization')
@@ -1355,7 +1589,6 @@ def main():
         if args.command == 'svg-to-gcode':
             params = CuttingParameters(
                 material_thickness=args.material_thickness,
-                cut_depth_per_pass=args.cut_depth,
                 number_of_passes=args.passes,
                 knife_force=args.knife_force,
                 movement_speed=args.movement_speed,
@@ -1363,7 +1596,12 @@ def main():
                 knife_offset=args.knife_offset,
                 corner_loop_radius=args.corner_loop_radius,
                 join_paths=args.join_paths,
-                path_tolerance=args.path_tolerance
+                path_tolerance=args.path_tolerance,
+                origin_top_left=args.origin_top_left,
+                mirror_x=args.mirror_x,
+                mirror_y=args.mirror_y,
+                z_offset=args.z_offset,
+                z_safe_height=args.z_safe_height
             )
             
             tools = GCodeTools(params)

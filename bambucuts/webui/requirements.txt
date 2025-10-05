@@ -1,0 +1,3 @@
+flask>=2.3.0
+flask-cors>=4.0.0
+bambulabs_api>=2.6.4

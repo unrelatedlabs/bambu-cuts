@@ -1,0 +1,102 @@
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+.claude/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Logs
+*.log
+makegcode.log
+
+# Configuration (contains secrets)
+.bambucuts.conf
+config.py.bak
+
+# Generated files
+*.gcode
+*.svg
+*.3mf
+*.3mf.zip
+!bambucuts/template.3mf
+
+# Test files
+test_files/
+test_*.py
+badge*.svg
+badge*.gcode
+circle*.gcode
+smile*.gcode
+builder*.svg
+liner*.svg
+test_*.svg
+plate_*.gcode
+output.gcode
+empty.gcode
+Untitled*/
+Metadata/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+
+# Distribution
+*.tar.gz
+*.zip
+
+# Documentation builds
+docs/_build/
