@@ -5,7 +5,7 @@ Control your Bambu Lab 3D printer as a CNC cutter or plotter. Convert SVG/DXF fi
 
 # WARNING
 
-This can brake your printer, or you, or your cat, or all of the above. Especially if you put a knife on your printer. Using this software there will be no hard limits of the printer movements, make sure your gcode is reasonable. 
+This can break your printer, or you, or your cat, or all of the above. Especially if you put a knife on your printer. Using this software there will be no hard limits of the printer movements, make sure your gcode is reasonable. 
 
 
 The origin of the print is at the current tool head position for X and Y. 
