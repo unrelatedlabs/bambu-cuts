@@ -41,6 +41,8 @@ The printer needs to be in LAN mode with developer options enabled, or run an ol
 
 ![Cutter Assembly](docs/cutter_crosssection.jpeg)
 
+Print in PETG! PLA tends to creep more. 
+
 Parts: 
  - 2mm ID 6mm OD 3mm deep bearing 2x. https://amzn.to/46W4Ju7
  - roland style 2mm shaft blades https://amzn.to/4gY9w2Q 
