@@ -738,7 +738,7 @@ def send_all_gcode_3mf():
 
         # Convert to 3MF using template
         template_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                     'test_files', 'template.3mf')
+                                     'template.3mf')
 
         if not os.path.exists(template_path):
             return jsonify({'success': False, 'error': f'Template file not found: {template_path}'}), 500
@@ -807,7 +807,7 @@ def create_3mf():
 
         # Convert to 3MF using template
         template_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                     'test_files', 'template.3mf')
+                                     'template.3mf')
 
         if not os.path.exists(template_path):
             return jsonify({'success': False, 'error': f'Template file not found: {template_path}'}), 500
@@ -885,7 +885,8 @@ def convert_to_gcode():
             movement_speed=3000.0,
             join_paths=True,
             knife_offset=0.0,  # No offset for pen plotting
-            origin_top_left=True
+            origin_top_left=True,
+            mirror_y=True  # Mirror Y by default for correct orientation
         )
 
         gcode_tools = GCodeTools(params)

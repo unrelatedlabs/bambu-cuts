@@ -33,25 +33,101 @@ class SVGPathJoinerRemoveMRegex:
     
     def load_svg(self, svg_file: str) -> None:
         """
-        Load SVG file and extract paths.
-        
+        Load SVG file and extract paths with proper unit handling.
+
         Args:
             svg_file: Path to SVG file
         """
+        import xml.etree.ElementTree as ET
+
+        # Load paths with svgpathtools
         self.paths, self.attributes = svg2paths(svg_file)
+
+        # Parse SVG to get viewBox and dimensions for proper scaling
+        tree = ET.parse(svg_file)
+        root = tree.getroot()
+        viewbox = root.get('viewBox')
+
+        if viewbox:
+            # Parse viewBox: "min-x min-y width height"
+            vb_parts = [float(x) for x in viewbox.split()]
+            if len(vb_parts) == 4:
+                vb_x, vb_y, vb_width, vb_height = vb_parts
+
+                # Get actual path bounding box from svgpathtools
+                if self.paths:
+                    min_x = min(path.bbox()[0] for path in self.paths if path.bbox())
+                    max_x = max(path.bbox()[1] for path in self.paths if path.bbox())
+                    min_y = min(path.bbox()[2] for path in self.paths if path.bbox())
+                    max_y = max(path.bbox()[3] for path in self.paths if path.bbox())
+
+                    # Calculate scale factor: viewBox units / actual coordinates
+                    actual_width = max_x - min_x
+                    actual_height = max_y - min_y
+
+                    if actual_width > 0 and actual_height > 0:
+                        scale_x = vb_width / actual_width
+                        scale_y = vb_height / actual_height
+
+                        # Use uniform scale (take minimum to preserve aspect ratio)
+                        scale = min(scale_x, scale_y)
+
+                        # Only scale if there's a significant difference
+                        if abs(scale - 1.0) > 0.01:
+                            print(f"Scaling paths by {scale:.3f} to match viewBox")
+                            # Scale all paths
+                            from svgpathtools import Path, Line, CubicBezier, QuadraticBezier, Arc
+                            scaled_paths = []
+                            for path in self.paths:
+                                scaled_segments = []
+                                for seg in path:
+                                    # Scale each segment
+                                    if isinstance(seg, Line):
+                                        scaled_seg = Line(seg.start * scale, seg.end * scale)
+                                    elif isinstance(seg, CubicBezier):
+                                        scaled_seg = CubicBezier(
+                                            seg.start * scale,
+                                            seg.control1 * scale,
+                                            seg.control2 * scale,
+                                            seg.end * scale
+                                        )
+                                    elif isinstance(seg, QuadraticBezier):
+                                        scaled_seg = QuadraticBezier(
+                                            seg.start * scale,
+                                            seg.control * scale,
+                                            seg.end * scale
+                                        )
+                                    elif isinstance(seg, Arc):
+                                        scaled_seg = Arc(
+                                            seg.start * scale,
+                                            complex(seg.radius.real * scale, seg.radius.imag * scale),
+                                            seg.rotation,
+                                            seg.large_arc,
+                                            seg.sweep,
+                                            seg.end * scale
+                                        )
+                                    else:
+                                        scaled_seg = seg
+                                    scaled_segments.append(scaled_seg)
+                                scaled_paths.append(Path(*scaled_segments))
+                            self.paths = scaled_paths
+
         print(f"Loaded {len(self.paths)} paths from {svg_file}")
     
     def join_paths(self) -> Tuple[List[Path], List[dict]]:
         """
         Join paths into continuous paths by removing M commands.
         Only joins paths that are actually close enough to be connected.
-        
+
         Returns:
             Tuple of (joined_paths, joined_attributes)
         """
         if not self.paths:
             return [], []
-        
+
+        # Remove duplicate paths first
+        self._remove_duplicate_paths()
+
         # Group paths into connected components
         connected_components = self._find_connected_components()
         
@@ -76,7 +152,38 @@ class SVGPathJoinerRemoveMRegex:
         
         print(f"Joined {len(self.paths)} paths into {len(joined_paths)} continuous paths")
         return self.joined_paths, self.joined_attributes
-    
+
+    def _remove_duplicate_paths(self) -> None:
+        """Remove duplicate paths from the list."""
+        if not self.paths:
+            return
+
+        unique_paths = []
+        unique_attributes = []
+        seen_hashes = set()
+
+        for i, path in enumerate(self.paths):
+            # Create a hash of the path by converting all segments to a string
+            path_str = ""
+            for seg in path:
+                # Use rounded coordinates to handle floating point variations
+                if hasattr(seg, 'start'):
+                    path_str += f"S{seg.start.real:.6f},{seg.start.imag:.6f}"
+                if hasattr(seg, 'end'):
+                    path_str += f"E{seg.end.real:.6f},{seg.end.imag:.6f}"
+
+            path_hash = hash(path_str)
+
+            if path_hash not in seen_hashes:
+                seen_hashes.add(path_hash)
+                unique_paths.append(path)
+                unique_attributes.append(self.attributes[i] if i < len(self.attributes) else {})
+
+        if len(unique_paths) < len(self.paths):
+            print(f"Removed {len(self.paths) - len(unique_paths)} duplicate paths")
+            self.paths = unique_paths
+            self.attributes = unique_attributes
+
     def _find_connected_components(self) -> List[List[int]]:
         """
         Find connected components of paths using Shapely for accurate distance calculation.

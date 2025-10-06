@@ -20,10 +20,22 @@ _config_data = {}
 
 def load_config():
     """Load configuration from file or prompt user."""
+    # Default MQTT settings
+    defaults = {
+        'mqtt_enabled': False,
+        'mqtt_broker': 'localhost',
+        'mqtt_port': 1883,
+        'mqtt_topic': 'bambucuts/estop'
+    }
+
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, 'r') as f:
                 config = json.load(f)
+                # Add MQTT defaults if not present
+                for key, value in defaults.items():
+                    if key not in config:
+                        config[key] = value
                 return config
         except Exception as e:
             print(f"Error reading config file: {e}")
@@ -43,6 +55,9 @@ def load_config():
         'access_code': access_code
     }
 
+    # Add MQTT defaults
+    config.update(defaults)
+
     # Save the configuration
     save_config(config)
     print(f"\nConfiguration saved to {CONFIG_FILE}\n")
@@ -61,7 +76,7 @@ def save_config(config):
         return False
 
 
-def update_config(ip=None, serial=None, access_code=None):
+def update_config(ip=None, serial=None, access_code=None, mqtt_enabled=None, mqtt_broker=None, mqtt_port=None, mqtt_topic=None):
     """Update configuration with new values."""
     try:
         # Update with new values (only if provided)
@@ -71,6 +86,14 @@ def update_config(ip=None, serial=None, access_code=None):
             _config_data['serial'] = serial
         if access_code is not None:
             _config_data['access_code'] = access_code
+        if mqtt_enabled is not None:
+            _config_data['mqtt_enabled'] = mqtt_enabled
+        if mqtt_broker is not None:
+            _config_data['mqtt_broker'] = mqtt_broker
+        if mqtt_port is not None:
+            _config_data['mqtt_port'] = mqtt_port
+        if mqtt_topic is not None:
+            _config_data['mqtt_topic'] = mqtt_topic
 
         # Save to file
         if save_config(_config_data):

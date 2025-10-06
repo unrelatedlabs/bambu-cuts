@@ -28,6 +28,7 @@ document.addEventListener('DOMContentLoaded', () => {
     updateStatus();
     updateHistory();
     loadConfig();
+    updateMqttStatus();
 
     // Setup editor drag and drop
     setupEditorDragDrop();
@@ -657,6 +658,7 @@ function startStatusPolling() {
     // Poll status every 2 seconds
     state.updateInterval = setInterval(() => {
         updateStatus();
+        updateMqttStatus();
     }, 2000);
 }
 
@@ -689,6 +691,10 @@ async function loadConfig() {
         document.getElementById('printerIP').value = data.ip;
         document.getElementById('printerSerial').value = data.serial;
         document.getElementById('printerAccessCode').value = data.access_code;
+        document.getElementById('mqttEnabled').checked = data.mqtt_enabled || false;
+        document.getElementById('mqttBroker').value = data.mqtt_broker || 'localhost';
+        document.getElementById('mqttPort').value = data.mqtt_port || 1883;
+        document.getElementById('mqttTopic').value = data.mqtt_topic || 'bambucuts/estop';
     } catch (error) {
         console.error('Failed to load config:', error);
     }
@@ -698,6 +704,10 @@ async function saveConfig() {
     const ip = document.getElementById('printerIP').value;
     const serial = document.getElementById('printerSerial').value;
     const accessCode = document.getElementById('printerAccessCode').value;
+    const mqttEnabled = document.getElementById('mqttEnabled').checked;
+    const mqttBroker = document.getElementById('mqttBroker').value;
+    const mqttPort = parseInt(document.getElementById('mqttPort').value);
+    const mqttTopic = document.getElementById('mqttTopic').value;
 
     try {
         const response = await fetch(`${API_BASE}/api/config`, {
@@ -706,7 +716,11 @@ async function saveConfig() {
             body: JSON.stringify({
                 ip: ip,
                 serial: serial,
-                access_code: accessCode
+                access_code: accessCode,
+                mqtt_enabled: mqttEnabled,
+                mqtt_broker: mqttBroker,
+                mqtt_port: mqttPort,
+                mqtt_topic: mqttTopic
             })
         });
 
@@ -714,12 +728,63 @@ async function saveConfig() {
 
         if (data.success) {
             showNotification(data.message, 'success');
+            // Refresh MQTT status after config save
+            updateMqttStatus();
         } else {
             showNotification(`Failed to save config: ${data.error}`, 'error');
         }
     } catch (error) {
         console.error('Save config error:', error);
         showNotification('Failed to save configuration', 'error');
+    }
+}
+
+// Emergency Stop Functions
+
+async function triggerEstop() {
+    if (!confirm('⚠️ EMERGENCY STOP: This will immediately halt all printer movements. Continue?')) {
+        return;
+    }
+
+    try {
+        const response = await fetch(`${API_BASE}/api/estop`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            showNotification('🛑 EMERGENCY STOP ACTIVATED!', 'error');
+        } else {
+            showNotification(`E-stop failed: ${data.error}`, 'error');
+        }
+    } catch (error) {
+        console.error('E-stop error:', error);
+        showNotification('Failed to trigger emergency stop', 'error');
+    }
+}
+
+async function updateMqttStatus() {
+    try {
+        const response = await fetch(`${API_BASE}/api/mqtt/status`);
+        const data = await response.json();
+
+        const statusEl = document.getElementById('mqttStatus');
+        if (data.mqtt_enabled) {
+            if (data.mqtt_connected) {
+                statusEl.textContent = `MQTT: Connected to ${data.mqtt_broker}:${data.mqtt_port}`;
+                statusEl.className = 'mqtt-status connected';
+            } else {
+                statusEl.textContent = `MQTT: Disconnected (${data.mqtt_broker}:${data.mqtt_port})`;
+                statusEl.className = 'mqtt-status disconnected';
+            }
+        } else {
+            statusEl.textContent = 'MQTT: Disabled';
+            statusEl.className = 'mqtt-status disconnected';
+        }
+    } catch (error) {
+        console.error('Failed to get MQTT status:', error);
     }
 }
 

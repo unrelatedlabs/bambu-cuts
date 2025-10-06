@@ -70,6 +70,15 @@ header h1 {
     justify-content: center;
 }
 
+.status-buttons {
+    display: flex;
+    gap: 10px;
+}
+
+.status-buttons button {
+    flex: 1;
+}
+
 .config-box {
     background: var(--bg-secondary);
     border: 2px solid var(--border-color);
@@ -1212,4 +1221,45 @@ header h1 {
     .gcode-editor {
         min-height: 300px;
     }
+}
+
+/* Emergency Stop Button */
+.btn-estop {
+    padding: 10px 20px;
+    font-size: 1rem;
+    font-weight: bold;
+    background: var(--danger);
+    color: white;
+    border: 2px solid darkred;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    box-shadow: 0 2px 5px rgba(231, 76, 60, 0.4);
+}
+
+.btn-estop:hover {
+    background: #c0392b;
+    transform: scale(1.02);
+    box-shadow: 0 3px 8px rgba(231, 76, 60, 0.6);
+}
+
+.btn-estop:active {
+    background: #a93226;
+    transform: scale(0.98);
+}
+
+.mqtt-status {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    font-weight: normal;
+}
+
+.mqtt-status.connected {
+    color: var(--success);
+}
+
+.mqtt-status.disconnected {
+    color: var(--warning);
 }

@@ -38,20 +38,21 @@ def cmd_svg2gcode(args):
 
     # Set up cutting parameters
     params = CuttingParameters(
-        tool_diameter=args.tool_diameter,
-        cutting_depth=args.depth,
-        feed_rate=args.feed_rate,
-        plunge_rate=args.plunge_rate,
-        safe_height=args.safe_height
+        material_thickness=0.0,  # For plotting, no Z depth
+        cutting_speed=args.feed_rate,
+        movement_speed=3000.0,
+        join_paths=True,
+        knife_offset=0.0,  # No offset for pen plotting
+        origin_top_left=True,
+        mirror_y=True  # Mirror Y by default for correct orientation
     )
 
     # Convert
     try:
-        tools = GCodeTools(str(input_path), params)
-        gcode = tools.svg_to_gcode()
+        tools = GCodeTools(params)
+        gcode = tools.svg_to_gcode(str(input_path), str(output_path))
 
-        # Write output
-        output_path.write_text(gcode)
+        # Write output (svg_to_gcode already writes the file if output_path is provided)
         print(f"G-code written to: {output_path}")
         print(f"Generated {len(gcode.splitlines())} lines of G-code")
     except Exception as e:

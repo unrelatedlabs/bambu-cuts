@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Cutter and Plotter control for Bambu Lab 3D Printers"
 readme = "README.md"
 requires-python = ">=3.8"
-license = {text = "MIT"}
+license = {text = "GPL-3.0-or-later"}
 authors = [
     {name = "Pero"}
 ]
@@ -16,6 +16,7 @@ keywords = ["bambu", "cnc", "plotter", "gcode", "3d-printer"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Manufacturing",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Topic :: System :: Hardware",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
@@ -30,6 +31,7 @@ dependencies = [
     "flask>=2.0.0",
     "flask-cors>=3.0.0",
     "flask-socketio>=5.0.0",
+    "paho-mqtt>=1.6.0",
     "bambulabs_api",
     "svgpathtools",
     "shapely",
