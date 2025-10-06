@@ -48,6 +48,7 @@ Parts:
  - roland style 2mm shaft blades https://amzn.to/4gY9w2Q 
  - 7mm OD, 20mm long spring https://amzn.to/4mQEISK
  - 1.7mm diameter 13mm long steel rod. (I cut a nail to size)
+ - a small magnet to hold the blade. I've attached it on the clamp after the cutter is mounted on the printer. 
 
 
  The cutter assembly fits in the place of the hot end. Insert to a piece of filament to control the spring tension with the extruder.
@@ -165,6 +166,8 @@ Run `bambucuts --help` for full options.
 - Load gcode in webui 
 - Print 3mf
 
+
+I use these cutting mats to hold the material https://amzn.to/3Ixn2xJ
 
 ## License
 
