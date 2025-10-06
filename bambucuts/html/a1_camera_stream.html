@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bambu A1 Camera Stream</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 100%);
+            color: white;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        .header {
+            text-align: center;
+            padding: 20px;
+            background: rgba(0,0,0,0.3);
+            backdrop-filter: blur(10px);
+        }
+        h1 {
+            color: #00ff88;
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            text-shadow: 0 0 20px rgba(0,255,136,0.5);
+        }
+        .status {
+            padding: 10px 20px;
+            border-radius: 25px;
+            display: inline-block;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+        .status.connected { background: rgba(0,255,136,0.2); color: #00ff88; }
+        .status.connecting { background: rgba(255,193,7,0.2); color: #ffc107; }
+        .status.error { background: rgba(255,68,68,0.2); color: #ff4444; }
+        
+        .main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        .stream-container {
+            background: rgba(0,0,0,0.4);
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.1);
+            max-width: 100%;
+            width: 100%;
+            max-width: 1200px;
+        }
+        #stream {
+            width: 100%;
+            height: auto;
+            border-radius: 15px;
+            box-shadow: 0 4px 20px rgba(0,255,136,0.3);
+            transition: all 0.3s ease;
+        }
+        #stream:hover {
+            transform: scale(1.02);
+            box-shadow: 0 6px 30px rgba(0,255,136,0.5);
+        }
+        .controls {
+            margin-top: 30px;
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        button {
+            background: linear-gradient(45deg, #00ff88, #00cc6a);
+            color: #1a1a1a;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 16px;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(0,255,136,0.3);
+        }
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(0,255,136,0.4);
+        }
+        button:active {
+            transform: translateY(0);
+        }
+        button:disabled {
+            background: #666;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        .error-message {
+            background: rgba(255,68,68,0.1);
+            border: 1px solid rgba(255,68,68,0.3);
+            color: #ff4444;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            text-align: center;
+            display: none;
+        }
+        .loading {
+            text-align: center;
+            padding: 40px;
+        }
+        .spinner {
+            border: 3px solid rgba(0,255,136,0.3);
+            border-top: 3px solid #00ff88;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🖨️ Bambu A1 Camera Stream</h1>
+        <div class="status connecting" id="status">Connecting...</div>
+    </div>
+    
+    <div class="main">
+        <div class="stream-container">
+            <div class="loading" id="loading">
+                <div class="spinner"></div>
+                <div>Connecting to camera stream...</div>
+            </div>
+            <img id="stream" style="display: none;" alt="Camera Stream">
+            <div class="error-message" id="error"></div>
+        </div>
+        
+        <div class="controls">
+            <button id="reconnect" onclick="reconnect()">Reconnect</button>
+            <button id="fullscreen" onclick="toggleFullscreen()">Fullscreen</button>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
+        let reconnectTimeout = null;
+
+        function updateStatus(message, type = 'connecting') {
+            const status = document.getElementById('status');
+            const loading = document.getElementById('loading');
+            const stream = document.getElementById('stream');
+            const error = document.getElementById('error');
+            
+            status.textContent = message;
+            status.className = `status ${type}`;
+            
+            if (type === 'connected') {
+                loading.style.display = 'none';
+                stream.style.display = 'block';
+                error.style.display = 'none';
+            } else if (type === 'error') {
+                loading.style.display = 'none';
+                stream.style.display = 'none';
+                error.textContent = message;
+                error.style.display = 'block';
+            } else {
+                loading.style.display = 'block';
+                stream.style.display = 'none';
+                error.style.display = 'none';
+            }
+        }
+
+        function connect() {
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+
+            if (reconnectTimeout) {
+                clearTimeout(reconnectTimeout);
+                reconnectTimeout = null;
+            }
+
+            updateStatus('Connecting to stream...', 'connecting');
+            
+            try {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const port = window.location.port ? parseInt(window.location.port) + 1 : 8081;
+                const wsUrl = `${protocol}//${window.location.hostname}:${port}/ws`;
+                ws = new WebSocket(wsUrl);
+                
+                ws.onopen = function() {
+                    updateStatus('Connected - Streaming live video', 'connected');
+                    reconnectAttempts = 0;
+                };
+                
+                ws.onmessage = function(event) {
+                    try {
+                        const data = JSON.parse(event.data);
+                        if (data.type === 'frame' && data.data) {
+                            const img = document.getElementById('stream');
+                            img.src = `data:image/jpeg;base64,${data.data}`;
+                        }
+                    } catch (e) {
+                        console.error('Error parsing WebSocket message:', e);
+                    }
+                };
+                
+                ws.onclose = function(event) {
+                    ws = null;
+                    if (!event.wasClean) {
+                        handleReconnect();
+                    }
+                };
+                
+                ws.onerror = function(error) {
+                    console.error('WebSocket error:', error);
+                    updateStatus('Connection error', 'error');
+                };
+                
+            } catch (error) {
+                console.error('Failed to create WebSocket:', error);
+                updateStatus('Failed to connect', 'error');
+            }
+        }
+
+        function handleReconnect() {
+            if (reconnectAttempts < maxReconnectAttempts) {
+                reconnectAttempts++;
+                updateStatus(`Connection lost. Reconnecting... (${reconnectAttempts}/${maxReconnectAttempts})`, 'error');
+                reconnectTimeout = setTimeout(connect, 2000 * reconnectAttempts);
+            } else {
+                updateStatus('Failed to reconnect. Please refresh the page.', 'error');
+            }
+        }
+
+        function reconnect() {
+            reconnectAttempts = 0;
+            connect();
+        }
+
+        function toggleFullscreen() {
+            const img = document.getElementById('stream');
+            if (!document.fullscreenElement) {
+                if (img.requestFullscreen) {
+                    img.requestFullscreen();
+                } else if (img.webkitRequestFullscreen) {
+                    img.webkitRequestFullscreen();
+                } else if (img.msRequestFullscreen) {
+                    img.msRequestFullscreen();
+                }
+            } else {
+                document.exitFullscreen();
+            }
+        }
+
+        // Handle page visibility changes
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden) {
+                if (ws) {
+                    ws.close();
+                    ws = null;
+                }
+                updateStatus('Connection paused (tab hidden)', 'error');
+            } else if (!ws) {
+                reconnect();
+            }
+        });
+
+        // Start connection when page loads
+        window.onload = connect;
+    </script>
+</body>
+</html>
