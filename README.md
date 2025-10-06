@@ -64,7 +64,7 @@ Parts:
 
 
 
-![Cutter Cross-Section](docs/cutter crosssection.jpeg)
+![Cutter Cross-Section](docs/cutter_crosssection.jpeg)
 
 *Detailed cross-section view of the cutter mechanism*
 - 🖥️ **CLI Tools** - Command-line utilities for batch processing
