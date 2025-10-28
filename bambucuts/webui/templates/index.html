@@ -111,9 +111,9 @@
                         <h3>📏 Z Positioning</h3>
                         <div class="button-grid-compact-4col">
                             <button class="btn btn-special" id="moveZ0">0mm</button>
+                            <button class="btn btn-special" id="moveZ2">2mm</button>
                             <button class="btn btn-special" id="moveZ10">10mm</button>
                             <button class="btn btn-special" id="moveZ50">50mm</button>
-                            <button class="btn btn-special" id="moveZ100">100mm</button>
                         </div>
                     </div>
 
@@ -143,6 +143,22 @@
                     <div class="gcode-input-container">
                         <input type="text" id="gcodeInput" placeholder="Enter G-code command (e.g., G1 X10 Y20)">
                         <button class="btn btn-primary" id="sendGcode">Send</button>
+                    </div>
+                </section>
+
+                <!-- Laser Section -->
+                <section class="laser-section">
+                    <h2>🔴 Laser Control</h2>
+                    <div class="laser-controls">
+                        <div class="laser-buttons">
+                            <button class="btn btn-danger" id="laserOnBtn">ON</button>
+                            <button class="btn btn-secondary" id="laserOffBtn">OFF</button>
+                        </div>
+                        <div class="laser-slider-container">
+                            <label for="laserPowerSlider">Power: <span id="laserPowerValue">50</span>%</label>
+                            <input type="range" id="laserPowerSlider" min="0" max="100" value="50" class="laser-slider">
+                            <button class="btn btn-secondary" id="setLaserPowerBtn">Set Power</button>
+                        </div>
                     </div>
                 </section>
 

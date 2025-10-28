@@ -76,9 +76,9 @@ function attachEventListeners() {
     document.getElementById('saveZ').addEventListener('click', saveZZero);
     document.getElementById('resetE').addEventListener('click', resetEZero);
     document.getElementById('moveZ0').addEventListener('click', () => moveZAbsolute(0));
+    document.getElementById('moveZ2').addEventListener('click', () => moveZAbsolute(2));
     document.getElementById('moveZ10').addEventListener('click', () => moveZAbsolute(10));
     document.getElementById('moveZ50').addEventListener('click', () => moveZAbsolute(50));
-    document.getElementById('moveZ100').addEventListener('click', () => moveZAbsolute(100));
 
     // G-code input
     document.getElementById('sendGcode').addEventListener('click', sendCustomGcode);
@@ -86,6 +86,16 @@ function attachEventListeners() {
         if (e.key === 'Enter') {
             sendCustomGcode();
         }
+    });
+
+    // Laser controls
+    document.getElementById('laserOnBtn').addEventListener('click', laserOn);
+    document.getElementById('laserOffBtn').addEventListener('click', laserOff);
+    document.getElementById('setLaserPowerBtn').addEventListener('click', setLaserPower);
+    const laserPowerSlider = document.getElementById('laserPowerSlider');
+    const laserPowerValue = document.getElementById('laserPowerValue');
+    laserPowerSlider.addEventListener('input', (e) => {
+        laserPowerValue.textContent = e.target.value;
     });
 
     // Step size pill buttons
@@ -540,13 +550,96 @@ async function sendCustomGcode() {
             updatePositionDisplay(data.position);
             updateHistory();
             showNotification('G-code sent', 'success');
-            input.value = '';  // Clear input
         } else {
             showNotification(`G-code failed: ${data.error}`, 'error');
         }
     } catch (error) {
         console.error('G-code error:', error);
         showNotification('Failed to send G-code', 'error');
+    }
+}
+
+async function laserOn() {
+    if (!state.printerConnected) {
+        showNotification('Printer not connected', 'warning');
+        return;
+    }
+
+    try {
+        const response = await fetch(`${API_BASE}/api/gcode`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ gcode: 'M620 P1 M621 P1 M400' })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            showNotification('Laser ON', 'success');
+            updateHistory();
+        } else {
+            showNotification('Failed to turn laser on', 'error');
+        }
+    } catch (error) {
+        console.error('Laser ON error:', error);
+        showNotification('Failed to turn laser on', 'error');
+    }
+}
+
+async function laserOff() {
+    if (!state.printerConnected) {
+        showNotification('Printer not connected', 'warning');
+        return;
+    }
+
+    try {
+        const response = await fetch(`${API_BASE}/api/gcode`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ gcode: 'M620 P0 M621 P0 M400' })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            showNotification('Laser OFF', 'success');
+            updateHistory();
+        } else {
+            showNotification('Failed to turn laser off', 'error');
+        }
+    } catch (error) {
+        console.error('Laser OFF error:', error);
+        showNotification('Failed to turn laser off', 'error');
+    }
+}
+
+async function setLaserPower() {
+    if (!state.printerConnected) {
+        showNotification('Printer not connected', 'warning');
+        return;
+    }
+
+    const power = parseInt(document.getElementById('laserPowerSlider').value);
+    const powerValue = power * 2;
+
+    try {
+        const response = await fetch(`${API_BASE}/api/gcode`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ gcode: `M620 P${powerValue} M621 P${powerValue} M400` })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            showNotification(`Laser power set to ${power}%`, 'success');
+            updateHistory();
+        } else {
+            showNotification('Failed to set laser power', 'error');
+        }
+    } catch (error) {
+        console.error('Set laser power error:', error);
+        showNotification('Failed to set laser power', 'error');
     }
 }
 
