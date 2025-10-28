@@ -1,3 +1,5 @@
+# USE PROTECTION
+OD6+ Laser googles for 450nm, good ventilation and a respirator! Some materials are very toxic!!!!
 
 # A1 Mini laser cutter
 
