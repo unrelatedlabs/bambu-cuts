@@ -37,6 +37,14 @@ AMS Lite pin out
       +-------------------+
              [Ret]
 
+## Firmware 
+
+Install CircuitPython on your ESP32 Board
+Copy over the code.py 
+
+## GCode File preparation 
+
+LightBurn with the attached settings. Or Kiri:Moto (roll your own settings)
 
 ## GCODE 
 
