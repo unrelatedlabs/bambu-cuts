@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>✂️ Bambu Cuts</title>
-    <link rel="stylesheet" href="/static/style.css?v=3">
+    <link rel="stylesheet" href="/static/style.css?v=4">
 </head>
 <body>
     <div class="container">
@@ -144,6 +144,7 @@
                         <input type="text" id="gcodeInput" placeholder="Enter G-code command (e.g., G1 X10 Y20)">
                         <button class="btn btn-primary" id="sendGcode">Send</button>
                     </div>
+                    <div class="gcode-mode-note">G90 = absolute positioning. G91 = relative positioning.</div>
                 </section>
 
                 <!-- Laser Section -->
@@ -173,6 +174,23 @@
 
             <!-- Right Column: G-code Editor -->
             <div class="right-column">
+                <section class="camera-section">
+                    <div class="camera-header">
+                        <h2>📷 Camera</h2>
+                        <div class="camera-actions">
+                            <button class="btn btn-primary" id="cameraStartBtn">Start</button>
+                            <button class="btn btn-secondary" id="cameraSnapshotBtn">Frame</button>
+                            <button class="btn btn-secondary" id="cameraStopBtn">Stop</button>
+                        </div>
+                    </div>
+
+                    <div class="camera-viewer" id="cameraViewer">
+                        <img id="cameraFrame" alt="Printer camera feed">
+                        <div class="camera-placeholder" id="cameraPlaceholder">Camera stopped</div>
+                    </div>
+                    <div class="camera-status" id="cameraStatus">Camera: stopped</div>
+                </section>
+
                 <section class="editor-section">
                     <div class="editor-header">
                         <h2>📄 G-code Editor</h2>
@@ -221,6 +239,6 @@ G1 X50 Y50 F1000  ; Move to position"></textarea>
         </div>
     </div>
 
-    <script src="/static/app.js?v=4"></script>
+    <script src="/static/app.js?v=5"></script>
 </body>
 </html>

@@ -8,6 +8,13 @@ let state = {
     stepSize: 1.0,
     printerConnected: false,
     printerIp: '',
+    mqttProgress: null,
+    directJob: null,
+    cameraStreaming: false,
+    cameraAlive: false,
+    cameraPollInterval: null,
+    cameraFrameRequestInFlight: false,
+    lastCameraFrameAt: null,
     updateInterval: null,
     currentFileName: 'Untitled.gcode',
     lastKissTime: 0,
@@ -127,6 +134,20 @@ function attachEventListeners() {
     document.getElementById('sendAllBtn').addEventListener('click', sendAllGcode);
     document.getElementById('sendDirectBtn').addEventListener('click', sendAllGcodeDirect);
     document.getElementById('download3mfBtn').addEventListener('click', download3mf);
+
+    // Camera controls
+    const cameraStartBtn = document.getElementById('cameraStartBtn');
+    const cameraStopBtn = document.getElementById('cameraStopBtn');
+    const cameraSnapshotBtn = document.getElementById('cameraSnapshotBtn');
+    if (cameraStartBtn) {
+        cameraStartBtn.addEventListener('click', startCamera);
+    }
+    if (cameraStopBtn) {
+        cameraStopBtn.addEventListener('click', stopCamera);
+    }
+    if (cameraSnapshotBtn) {
+        cameraSnapshotBtn.addEventListener('click', requestCameraFrame);
+    }
 
     // Filename changes
     document.getElementById('fileName').addEventListener('change', updateFileName);
@@ -671,10 +692,15 @@ async function updateStatus() {
         state.position = data.position;
         state.printerConnected = data.printer_connected;
         state.printerIp = data.printer_ip;
+        state.mqttProgress = data.mqtt_progress || null;
+        state.directJob = data.direct_job || null;
+        state.cameraStreaming = Boolean(data.camera_streaming);
+        state.cameraAlive = Boolean(data.camera_alive);
 
         // Update UI
         updatePositionDisplay(data.position);
-        updateConnectionStatus(data.printer_connected, data.printer_ip, data.connection_error, data.printer_state);
+        updateConnectionStatus(data.printer_connected, data.printer_ip, data.connection_error, data.printer_state, data.mqtt_progress, data.direct_job);
+        updateCameraControls(data.camera_streaming, data.camera_alive, data.printer_connected);
     } catch (error) {
         console.error('Status update error:', error);
     }
@@ -709,12 +735,12 @@ function updatePositionDisplay(position) {
     // Keep function for compatibility but do nothing
 }
 
-function updateConnectionStatus(connected, printerIp, error, printerState) {
+function updateConnectionStatus(connected, printerIp, error, printerState, mqttProgress, directJob) {
     const statusBox = document.getElementById('connectionStatus');
     const statusText = document.getElementById('statusText');
     const connectBtn = document.getElementById('connectBtn');
 
-    console.log('Updating connection status:', { connected, printerIp, error, printerState });
+    console.log('Updating connection status:', { connected, printerIp, error, printerState, mqttProgress, directJob });
 
     if (connected) {
         statusBox.className = 'status-box connected';
@@ -723,6 +749,23 @@ function updateConnectionStatus(connected, printerIp, error, printerState) {
             statusMessage += ` - ${printerState}`;
         } else {
             statusMessage += ' - RELATIVE MODE';
+        }
+        if (mqttProgress && mqttProgress.percent !== null && mqttProgress.percent !== undefined) {
+            statusMessage += ` - M73 ${mqttProgress.percent}%`;
+            if (mqttProgress.remaining_time !== null && mqttProgress.remaining_time !== undefined) {
+                statusMessage += ` / R${mqttProgress.remaining_time}`;
+            }
+        }
+        if (directJob && directJob.status && directJob.status !== 'idle') {
+            if (directJob.status === 'complete') {
+                statusMessage += ' - Direct done';
+            } else if (directJob.status === 'queue_error') {
+                statusMessage += ' - Direct queue error';
+            } else if (directJob.last_marker_index && directJob.logical_percent !== null && directJob.logical_percent !== undefined) {
+                statusMessage += ` - Direct ${directJob.logical_percent}% done`;
+            } else if (directJob.active) {
+                statusMessage += ' - Direct waiting';
+            }
         }
         statusText.textContent = statusMessage;
         connectBtn.textContent = 'Disconnect';
@@ -747,16 +790,201 @@ function showNotification(message, type = 'info') {
 
 // Polling
 function startStatusPolling() {
-    // Poll status every 2 seconds
+    // Poll cached status every second. MQTT updates are received in the backend.
     state.updateInterval = setInterval(() => {
         updateStatus();
-    }, 2000);
+    }, 1000);
 }
 
 function stopStatusPolling() {
     if (state.updateInterval) {
         clearInterval(state.updateInterval);
         state.updateInterval = null;
+    }
+}
+
+// Camera
+async function startCamera() {
+    if (!state.printerConnected) {
+        showNotification('Printer not connected', 'warning');
+        return;
+    }
+
+    try {
+        setCameraStatus('Camera: starting...', 'streaming');
+        const response = await fetch(`${API_BASE}/api/camera/start`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        const data = await response.json();
+
+        if (data.success) {
+            state.cameraStreaming = Boolean(data.streaming);
+            state.cameraAlive = true;
+            updateCameraControls(state.cameraStreaming, state.cameraAlive, state.printerConnected);
+            startCameraPolling();
+            showNotification(data.message || 'Camera started', 'success');
+            requestCameraFrame();
+        } else {
+            setCameraStatus(`Camera: ${data.error || data.message || 'failed to start'}`, 'error');
+            showNotification(data.error || data.message || 'Failed to start camera', 'error');
+        }
+    } catch (error) {
+        console.error('Camera start error:', error);
+        setCameraStatus('Camera: start failed', 'error');
+        showNotification('Failed to start camera', 'error');
+    }
+}
+
+async function stopCamera() {
+    try {
+        const response = await fetch(`${API_BASE}/api/camera/stop`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        const data = await response.json();
+
+        if (data.success) {
+            state.cameraStreaming = Boolean(data.streaming);
+            state.cameraAlive = false;
+            stopCameraPolling();
+            showCameraPlaceholder('Camera stopped');
+            updateCameraControls(state.cameraStreaming, state.cameraAlive, state.printerConnected);
+            showNotification(data.message || 'Camera stopped', 'info');
+        } else {
+            setCameraStatus(`Camera: ${data.error || 'stop failed'}`, 'error');
+            showNotification(data.error || 'Failed to stop camera', 'error');
+        }
+    } catch (error) {
+        console.error('Camera stop error:', error);
+        setCameraStatus('Camera: stop failed', 'error');
+        showNotification('Failed to stop camera', 'error');
+    }
+}
+
+async function requestCameraFrame() {
+    if (!state.printerConnected) {
+        showNotification('Printer not connected', 'warning');
+        return;
+    }
+
+    if (state.cameraFrameRequestInFlight) {
+        return;
+    }
+
+    try {
+        state.cameraFrameRequestInFlight = true;
+        const response = await fetch(`${API_BASE}/api/camera/frame`);
+        const data = await response.json();
+
+        if (data.success && data.frame) {
+            updateCameraFrame(data.frame);
+        } else if (data.status === 'warming_up') {
+            setCameraStatus('Camera: warming up...', 'streaming');
+        } else if (!state.cameraStreaming) {
+            setCameraStatus('Camera: no frame yet', '');
+        }
+    } catch (error) {
+        console.error('Camera frame error:', error);
+        setCameraStatus('Camera: frame failed', 'error');
+    } finally {
+        state.cameraFrameRequestInFlight = false;
+    }
+}
+
+function updateCameraFrame(frame) {
+    const image = document.getElementById('cameraFrame');
+    const placeholder = document.getElementById('cameraPlaceholder');
+    if (!image || !placeholder) {
+        return;
+    }
+
+    const frameSrc = frame.startsWith('data:') ? frame : `data:image/jpeg;base64,${frame}`;
+    image.src = frameSrc;
+    image.style.display = 'block';
+    placeholder.style.display = 'none';
+    state.lastCameraFrameAt = new Date();
+
+    if (state.cameraStreaming) {
+        setCameraStatus('Camera: streaming', 'streaming');
+    } else {
+        setCameraStatus('Camera: frame received', '');
+    }
+}
+
+function showCameraPlaceholder(message) {
+    const image = document.getElementById('cameraFrame');
+    const placeholder = document.getElementById('cameraPlaceholder');
+    if (!image || !placeholder) {
+        return;
+    }
+
+    image.removeAttribute('src');
+    image.style.display = 'none';
+    placeholder.textContent = message;
+    placeholder.style.display = 'flex';
+}
+
+function updateCameraControls(streaming, alive, connected) {
+    const startBtn = document.getElementById('cameraStartBtn');
+    const stopBtn = document.getElementById('cameraStopBtn');
+    const snapshotBtn = document.getElementById('cameraSnapshotBtn');
+
+    if (startBtn) {
+        startBtn.disabled = !connected || streaming;
+    }
+    if (stopBtn) {
+        stopBtn.disabled = !streaming;
+    }
+    if (snapshotBtn) {
+        snapshotBtn.disabled = !connected;
+    }
+
+    if (!connected) {
+        stopCameraPolling();
+        showCameraPlaceholder('Connect printer for camera');
+        setCameraStatus('Camera: disconnected', 'error');
+    } else if (streaming) {
+        startCameraPolling();
+        setCameraStatus('Camera: streaming', 'streaming');
+    } else if (alive) {
+        stopCameraPolling();
+        setCameraStatus('Camera: ready', '');
+    } else {
+        stopCameraPolling();
+        setCameraStatus('Camera: stopped', '');
+    }
+}
+
+function startCameraPolling() {
+    if (state.cameraPollInterval) {
+        return;
+    }
+
+    state.cameraPollInterval = setInterval(() => {
+        requestCameraFrame();
+    }, 250);
+}
+
+function stopCameraPolling() {
+    if (!state.cameraPollInterval) {
+        return;
+    }
+
+    clearInterval(state.cameraPollInterval);
+    state.cameraPollInterval = null;
+}
+
+function setCameraStatus(message, type = '') {
+    const status = document.getElementById('cameraStatus');
+    if (!status) {
+        return;
+    }
+
+    status.textContent = message;
+    status.classList.remove('streaming', 'error');
+    if (type) {
+        status.classList.add(type);
     }
 }
 
@@ -993,8 +1221,10 @@ async function sendAllGcodeDirect() {
         const data = await response.json();
 
         if (data.success) {
-            showNotification(`Successfully sent ${data.sent_count} G-code lines`, 'success');
+            const markerCount = data.progress && data.progress.marker_count ? data.progress.marker_count : 0;
+            showNotification(`Queued ${data.sent_count} G-code lines; waiting for ${markerCount} M73 checkpoints`, 'success');
             updateHistory();
+            updateStatus();
         } else {
             showNotification(`Send failed: ${data.error || 'Unknown error'}`, 'error');
             if (data.errors && data.errors.length > 0) {

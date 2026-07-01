@@ -85,6 +85,78 @@ def cmd_dxf2svg(args):
         sys.exit(1)
 
 
+def cmd_mqtt_dump(args):
+    """Dump raw MQTT report messages from the configured printer."""
+    if args.json and args.ndjson:
+        print("Use either --json or --ndjson, not both", file=sys.stderr)
+        sys.exit(2)
+    if args.follow and args.json:
+        print("--follow streams messages; use --ndjson or text output instead of --json", file=sys.stderr)
+        sys.exit(2)
+
+    from bambucuts import config
+    try:
+        from bambucuts.mqtt_dump import MqttDumpError, dump_mqtt, format_message
+    except ImportError as e:
+        print(f"MQTT dump requires paho-mqtt: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    cfg = config.get_config()
+    ip = args.ip or cfg.get('ip', '')
+    serial = args.serial or cfg.get('serial', '')
+    access_code = args.access_code or cfg.get('access_code', '')
+    duration = None if args.follow else args.seconds
+    max_messages = args.count if args.count is not None else (0 if args.follow else 5)
+    seen_count = 0
+
+    def print_live_message(message):
+        nonlocal seen_count
+        seen_count += 1
+        if args.ndjson:
+            import json
+            print(json.dumps({"type": "message", "message": message}, sort_keys=True), flush=True)
+        else:
+            if seen_count > 1 and not args.raw:
+                print()
+            print(format_message(message, index=seen_count, raw=args.raw), flush=True)
+
+    try:
+        if not args.json:
+            limit = "until interrupted" if duration is None and max_messages == 0 else "for the requested window"
+            print(f"Listening to Bambu MQTT reports {limit}...", file=sys.stderr)
+
+        dump = dump_mqtt(
+            ip,
+            access_code,
+            serial,
+            duration=duration,
+            max_messages=max_messages,
+            request_pushall=not args.no_pushall,
+            port=args.port,
+            on_message=None if args.json else print_live_message,
+        )
+    except KeyboardInterrupt:
+        print("\nStopped.", file=sys.stderr)
+        return
+    except MqttDumpError as e:
+        print(f"MQTT dump failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        import json
+        print(json.dumps(dump, indent=2, sort_keys=True))
+    elif args.ndjson:
+        import json
+        print(json.dumps({
+            "type": "summary",
+            "message_count": dump["message_count"],
+            "elapsed": dump["elapsed"],
+            "errors": dump["errors"],
+        }, sort_keys=True), flush=True)
+    else:
+        print(f"\nMessages: {dump['message_count']} in {dump['elapsed']:.2f}s", file=sys.stderr)
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -117,6 +189,21 @@ def main():
     dxf2svg_parser.add_argument('input', help='Input DXF file')
     dxf2svg_parser.add_argument('-o', '--output', help='Output SVG file (default: input.svg)')
     dxf2svg_parser.set_defaults(func=cmd_dxf2svg)
+
+    # MQTT dump command
+    mqtt_dump_parser = subparsers.add_parser('mqtt-dump', help='Dump raw Bambu MQTT report messages')
+    mqtt_dump_parser.add_argument('--ip', help='Printer IP address (default: configured printer IP)')
+    mqtt_dump_parser.add_argument('--serial', help='Printer serial number (default: configured serial)')
+    mqtt_dump_parser.add_argument('--access-code', help='Printer LAN access code (default: configured access code)')
+    mqtt_dump_parser.add_argument('--port', type=int, default=8883, help='Printer MQTT port (default: 8883)')
+    mqtt_dump_parser.add_argument('--seconds', type=float, default=5.0, help='Seconds to collect messages (default: 5)')
+    mqtt_dump_parser.add_argument('--count', type=int, default=None, help='Stop after this many messages, 0 for no limit (default: 5, or 0 with --follow)')
+    mqtt_dump_parser.add_argument('--follow', action='store_true', help='Keep streaming reports until Ctrl-C or --count is reached')
+    mqtt_dump_parser.add_argument('--no-pushall', action='store_true', help='Do not request a full printer report')
+    mqtt_dump_parser.add_argument('--raw', action='store_true', help='Print raw payload strings instead of pretty JSON messages')
+    mqtt_dump_parser.add_argument('--json', action='store_true', help='Print the whole dump result as JSON')
+    mqtt_dump_parser.add_argument('--ndjson', action='store_true', help='Stream one JSON object per line as messages arrive')
+    mqtt_dump_parser.set_defaults(func=cmd_mqtt_dump)
 
     # Parse arguments
     args = parser.parse_args()

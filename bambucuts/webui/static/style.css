@@ -745,6 +745,13 @@ header h1 {
     box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
 }
 
+.btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+}
+
 .btn:active {
     transform: translateY(0);
 }
@@ -810,6 +817,13 @@ header h1 {
 
 .gcode-input-container input::placeholder {
     color: var(--text-secondary);
+}
+
+.gcode-mode-note {
+    margin-top: 8px;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    line-height: 1.35;
 }
 
 /* Laser Section */
@@ -950,6 +964,79 @@ header h1 {
 
 .history-container::-webkit-scrollbar-thumb:hover {
     background: #d63952;
+}
+
+/* Camera Section */
+.camera-section {
+    background: var(--bg-secondary);
+    border: 2px solid var(--border-color);
+    border-radius: 10px;
+    padding: 20px;
+    margin-bottom: 20px;
+}
+
+.camera-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 15px;
+}
+
+.camera-header h2 {
+    color: var(--accent-secondary);
+    margin: 0;
+    font-size: 1.3rem;
+}
+
+.camera-actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.camera-viewer {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: #05070d;
+    border: 2px solid var(--border-color);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+#cameraFrame {
+    display: none;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: #05070d;
+}
+
+.camera-placeholder {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-secondary);
+    background: var(--bg-primary);
+    font-size: 0.95rem;
+}
+
+.camera-status {
+    margin-top: 10px;
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+}
+
+.camera-status.streaming {
+    color: var(--success);
+}
+
+.camera-status.error {
+    color: var(--danger);
 }
 
 /* G-code Editor Section */
@@ -1299,6 +1386,11 @@ header h1 {
         width: 100%;
     }
 
+    .camera-actions {
+        width: 100%;
+    }
+
+    .camera-actions button,
     .editor-actions button {
         flex: 1;
     }

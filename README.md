@@ -154,8 +154,56 @@ bambucuts dxf2svg input.dxf -o output.svg
 - `bambucuts server` - Start web interface
 - `bambucuts svg2gcode INPUT` - Convert SVG to G-code
 - `bambucuts dxf2svg INPUT` - Convert DXF to SVG
+- `bambucuts mqtt-dump` - Dump raw Bambu MQTT printer report messages
 
 Run `bambucuts --help` for full options.
+
+## Debugging printer MQTT reports
+
+To inspect the raw status payload from the printer:
+
+```bash
+bambucuts mqtt-dump --seconds 5 --count 5
+```
+
+The terminal output prints each report as it arrives. To keep listening:
+
+```bash
+bambucuts mqtt-dump --follow
+```
+
+For machine-readable live output:
+
+```bash
+bambucuts mqtt-dump --follow --ndjson
+```
+
+When the web server is running, the same dump is also available at:
+
+```bash
+curl "http://localhost:5425/api/mqtt-dump?seconds=5&count=5"
+```
+
+For streaming newline-delimited JSON:
+
+```bash
+curl -N "http://localhost:5425/api/mqtt-stream?seconds=60&count=0"
+```
+
+## G-code progress over MQTT
+
+`M73 P<percent> R<remaining>` updates the printer's MQTT progress fields, such as `mc_percent` and `mc_remaining_time`.
+
+When G-code is sent from the web UI, Bambu Cuts injects progress markers after batches of commands:
+
+```gcode
+M400
+M73 P32 R8
+```
+
+`M400` waits for queued motion to finish before the `M73` marker runs, so seeing the matching `mc_percent` and `mc_remaining_time` pair in MQTT means the printer has completed the previous batch.
+
+For `Print Direct`, the web UI tracks the active direct job separately. The send action only means the G-code was queued; execution is considered done when MQTT reports the exact final `M73 P... R...` checkpoint for that job. Checkpoint values are chosen so each marker changes and the first/final checkpoint do not reuse the cached stale MQTT value.
 
 ## My process 
 

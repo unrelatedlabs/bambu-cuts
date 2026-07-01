@@ -8,10 +8,11 @@ Provides RESTful endpoints for printer control, jogging, and G-code execution.
 Author: AI Assistant
 """
 
-from flask import Flask, render_template, jsonify, request, send_file
+from flask import Flask, render_template, jsonify, request, send_file, Response, stream_with_context
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 from werkzeug.utils import secure_filename
+import json
 import time
 import sys
 import os
@@ -19,6 +20,7 @@ import tempfile
 from pathlib import Path
 import threading
 import base64
+import math
 from io import BytesIO
 
 try:
@@ -47,15 +49,38 @@ state = {
     'printer_connected': False,
     'connection_error': None,
     'gcode_history': [],
-    'camera_streaming': False
+    'camera_streaming': False,
+    'mqtt_status': {
+        'connected': False,
+        'error': None,
+        'last_update': None,
+        'print': {}
+    },
+    'direct_job': {
+        'active': False,
+        'status': 'idle'
+    }
 }
 
 # Printer instance
 printer = None
 
+# Direct-send progress markers. Each marker is queued after an M400, so MQTT
+# progress reflects completed motion up to that batch.
+PROGRESS_BATCH_SIZE = 25
+
 # Camera streaming control
 camera_thread = None
 camera_stop_event = threading.Event()
+camera_frame_lock = threading.Lock()
+latest_camera_frame = None
+latest_camera_frame_time = None
+
+# MQTT status monitor control
+mqtt_status_thread = None
+mqtt_status_stop_event = threading.Event()
+mqtt_status_lock = threading.Lock()
+direct_job_lock = threading.Lock()
 
 
 def connect_printer():
@@ -76,6 +101,8 @@ def connect_printer():
         # Set relative mode for jogging
         set_relative_mode()
 
+        start_mqtt_status_monitor()
+
         return True
     except Exception as e:
         state['printer_connected'] = False
@@ -89,10 +116,10 @@ def disconnect_printer():
     global printer, state
 
     try:
-        if printer and state['printer_connected']:
-            # Stop camera if running
-            stop_camera_stream()
+        stop_camera_stream()
+        stop_mqtt_status_monitor()
 
+        if printer and state['printer_connected']:
             # Restore absolute mode before disconnecting
             set_absolute_mode()
             printer.disconnect()
@@ -104,6 +131,98 @@ def disconnect_printer():
         printer = None
 
 
+def _merge_mqtt_print_status(print_status):
+    """Merge Bambu's sparse MQTT print status deltas into the cached state."""
+    if not isinstance(print_status, dict):
+        return
+
+    with mqtt_status_lock:
+        cached_print = dict(state['mqtt_status'].get('print') or {})
+        cached_print.update(print_status)
+        state['mqtt_status'] = {
+            'connected': True,
+            'error': None,
+            'last_update': time.time(),
+            'print': cached_print
+        }
+
+
+def _handle_mqtt_status_message(message):
+    payload = message.get('json')
+    if not isinstance(payload, dict):
+        return
+
+    print_status = payload.get('print')
+    _merge_mqtt_print_status(print_status)
+
+
+def start_mqtt_status_monitor():
+    """Start a background MQTT listener that caches the latest print status."""
+    global mqtt_status_thread, mqtt_status_stop_event
+
+    if mqtt_status_thread and mqtt_status_thread.is_alive():
+        return True
+
+    cfg = config.get_config()
+    if not cfg.get('ip') or not cfg.get('access_code') or not cfg.get('serial'):
+        return False
+
+    try:
+        from bambucuts.mqtt_dump import MqttDumpError, listen_mqtt_reports
+    except ImportError as e:
+        with mqtt_status_lock:
+            state['mqtt_status']['error'] = f'MQTT status requires paho-mqtt: {e}'
+        return False
+
+    mqtt_status_stop_event.clear()
+
+    def worker():
+        while not mqtt_status_stop_event.is_set():
+            try:
+                listen_mqtt_reports(
+                    cfg.get('ip', ''),
+                    cfg.get('access_code', ''),
+                    cfg.get('serial', ''),
+                    _handle_mqtt_status_message,
+                    stop_event=mqtt_status_stop_event,
+                    request_pushall=True,
+                )
+            except MqttDumpError as e:
+                with mqtt_status_lock:
+                    cached_print = dict(state['mqtt_status'].get('print') or {})
+                    state['mqtt_status'] = {
+                        'connected': False,
+                        'error': str(e),
+                        'last_update': state['mqtt_status'].get('last_update'),
+                        'print': cached_print
+                    }
+                if not mqtt_status_stop_event.wait(5):
+                    continue
+
+    mqtt_status_thread = threading.Thread(target=worker, daemon=True)
+    mqtt_status_thread.start()
+    return True
+
+
+def stop_mqtt_status_monitor():
+    """Stop the background MQTT status listener."""
+    global mqtt_status_thread
+
+    mqtt_status_stop_event.set()
+    if mqtt_status_thread:
+        mqtt_status_thread.join(timeout=5)
+    mqtt_status_thread = None
+
+    with mqtt_status_lock:
+        cached_print = dict(state['mqtt_status'].get('print') or {})
+        state['mqtt_status'] = {
+            'connected': False,
+            'error': None,
+            'last_update': state['mqtt_status'].get('last_update'),
+            'print': cached_print
+        }
+
+
 def camera_stream_worker():
     """Background worker thread for streaming camera frames."""
     global printer, camera_stop_event
@@ -111,36 +230,31 @@ def camera_stream_worker():
     print("Camera stream worker started")
 
     try:
-        # Start the camera
-        if printer.camera_start():
-            print("Camera started successfully")
+        if not printer.camera_client_alive():
+            if not printer.camera_start():
+                print("Failed to start camera")
+                return
             time.sleep(1)  # Give camera time to initialize
 
-            while not camera_stop_event.is_set():
-                try:
-                    # Get camera frame (base64 encoded)
-                    frame_base64 = printer.get_camera_frame()
+        while not camera_stop_event.is_set():
+            try:
+                # Get camera frame (base64 encoded)
+                frame_base64 = printer.get_camera_frame()
 
-                    if frame_base64:
-                        # Process frame (placeholder for future CV work)
-                        processed_frame = process_camera_frame(frame_base64)
+                if frame_base64:
+                    # Process frame (placeholder for future CV work)
+                    processed_frame = process_camera_frame(frame_base64)
+                    remember_camera_frame(processed_frame)
 
-                        # Emit frame to all connected clients
-                        socketio.emit('camera_frame', {'frame': processed_frame}, namespace='/')
+                    # Emit frame to all connected clients
+                    socketio.emit('camera_frame', {'frame': processed_frame}, namespace='/')
 
-                    # Limit frame rate to ~10 FPS
-                    time.sleep(0.1)
+                # Limit frame rate to ~10 FPS
+                time.sleep(0.1)
 
-                except Exception as e:
-                    print(f"Error streaming frame: {e}")
-                    time.sleep(0.5)
-
-            # Stop camera when done
-            printer.camera_stop()
-            print("Camera stopped")
-
-        else:
-            print("Failed to start camera")
+            except Exception as e:
+                print(f"Error streaming frame: {e}")
+                time.sleep(0.5)
 
     except Exception as e:
         print(f"Camera stream worker error: {e}")
@@ -194,9 +308,17 @@ def process_camera_frame(frame_base64: str) -> str:
         return frame_base64
 
 
+def remember_camera_frame(frame_base64: str):
+    """Cache the latest camera frame for HTTP polling clients."""
+    global latest_camera_frame, latest_camera_frame_time
+    with camera_frame_lock:
+        latest_camera_frame = frame_base64
+        latest_camera_frame_time = time.time()
+
+
 def start_camera_stream():
     """Start camera streaming in background thread."""
-    global camera_thread, camera_stop_event, state
+    global camera_thread, camera_stop_event, state, latest_camera_frame, latest_camera_frame_time
 
     if state['camera_streaming']:
         print("Camera already streaming")
@@ -208,20 +330,26 @@ def start_camera_stream():
 
     # Reset stop event
     camera_stop_event.clear()
+    with camera_frame_lock:
+        latest_camera_frame = None
+        latest_camera_frame_time = None
 
     # Start camera thread
+    state['camera_streaming'] = True
     camera_thread = threading.Thread(target=camera_stream_worker, daemon=True)
     camera_thread.start()
 
-    state['camera_streaming'] = True
     return True
 
 
 def stop_camera_stream():
     """Stop camera streaming."""
-    global camera_thread, camera_stop_event, state
+    global camera_thread, camera_stop_event, state, latest_camera_frame, latest_camera_frame_time
 
     if not state['camera_streaming']:
+        with camera_frame_lock:
+            latest_camera_frame = None
+            latest_camera_frame_time = None
         return
 
     print("Stopping camera stream...")
@@ -231,6 +359,9 @@ def stop_camera_stream():
         camera_thread.join(timeout=5)
 
     state['camera_streaming'] = False
+    with camera_frame_lock:
+        latest_camera_frame = None
+        latest_camera_frame_time = None
 
 
 def set_relative_mode():
@@ -285,6 +416,297 @@ def add_to_history(gcode: str):
         state['gcode_history'].pop(0)
 
 
+def strip_inline_comment(line: str) -> str:
+    """Return the executable portion of a G-code line."""
+    return line.split(';', 1)[0].strip()
+
+
+def is_executable_gcode_line(line: str) -> bool:
+    return bool(strip_inline_comment(line))
+
+
+def extract_executable_gcode(gcode_text: str):
+    """Yield (line_number, executable_gcode) for non-empty G-code lines."""
+    for line_num, line in enumerate(gcode_text.split('\n'), 1):
+        code = strip_inline_comment(line)
+        if code:
+            yield line_num, code
+
+
+def clamp_progress_batch_size(value) -> int:
+    try:
+        batch_size = int(value)
+    except (TypeError, ValueError):
+        batch_size = PROGRESS_BATCH_SIZE
+    return max(1, min(500, batch_size))
+
+
+def current_mqtt_marker_pair():
+    """Return the currently cached (M73 P, M73 R) pair."""
+    with mqtt_status_lock:
+        cached_print = dict(state['mqtt_status'].get('print') or {})
+        return (
+            cached_print.get('mc_percent'),
+            cached_print.get('mc_remaining_time'),
+        )
+
+
+def _scaled_marker_percents(marker_count: int, mode: str = 'normal'):
+    if marker_count == 1:
+        if mode == 'lower':
+            return [99]
+        if mode == 'upper':
+            return [2]
+        return [100]
+
+    if mode == 'lower':
+        return [max(1, math.floor(index * 99 / marker_count)) for index in range(1, marker_count + 1)]
+    if mode == 'upper':
+        return [
+            2 + math.floor((index - 1) * 98 / (marker_count - 1))
+            for index in range(1, marker_count + 1)
+        ]
+    return [max(1, math.floor(index * 100 / marker_count)) for index in range(1, marker_count + 1)]
+
+
+def build_progress_marker_plan(total_commands: int, requested_batch_size: int, baseline_pair=None):
+    """Build unique M73 checkpoint pairs, avoiding the cached baseline value."""
+    if total_commands <= 0:
+        return [], requested_batch_size
+
+    batch_size = max(1, requested_batch_size)
+    marker_count = math.ceil(total_commands / batch_size)
+    if marker_count > 99:
+        batch_size = math.ceil(total_commands / 99)
+        marker_count = math.ceil(total_commands / batch_size)
+
+    baseline_pair = baseline_pair or (None, None)
+    candidate_modes = [
+        ('normal', 0),
+        ('lower', 0),
+        ('upper', 0),
+        ('normal', 1),
+        ('lower', 1),
+        ('upper', 1),
+    ]
+
+    for percent_mode, remaining_offset in candidate_modes:
+        percents = _scaled_marker_percents(marker_count, mode=percent_mode)
+        pairs = [
+            (percent, marker_count - index + remaining_offset)
+            for index, percent in enumerate(percents, 1)
+        ]
+        if len(set(pairs)) != len(pairs):
+            continue
+        if pairs[0] == baseline_pair or pairs[-1] == baseline_pair:
+            continue
+
+        return [
+            {
+                'index': index,
+                'percent': percent,
+                'remaining': remaining,
+            }
+            for index, (percent, remaining) in enumerate(pairs, 1)
+        ], batch_size
+
+    # This should be unreachable for marker_count <= 100, but keep a safe fallback.
+    percents = _scaled_marker_percents(marker_count, mode='lower')
+    return [
+        {
+            'index': index,
+            'percent': percent,
+            'remaining': marker_count - index + 1,
+        }
+        for index, percent in enumerate(percents, 1)
+    ], batch_size
+
+
+def progress_marker_lines(completed_commands: int, total_commands: int, marker):
+    """Create M73 marker lines after a completed batch."""
+    if total_commands <= 0:
+        return []
+
+    return [
+        f"; bambucuts progress: {completed_commands}/{total_commands}",
+        "M400 ; wait for queued motion before reporting progress",
+        f"M73 P{marker['percent']} R{marker['remaining']}",
+        f"M73 L{marker['index']}",
+    ]
+
+
+def add_m73_progress_markers(gcode_text: str, batch_size: int = PROGRESS_BATCH_SIZE, baseline_pair=None):
+    """Insert M73 progress markers after each batch of executable G-code."""
+    batch_size = clamp_progress_batch_size(batch_size)
+    lines = gcode_text.splitlines()
+    total_commands = sum(1 for line in lines if is_executable_gcode_line(line))
+
+    if total_commands == 0:
+        return gcode_text, {
+            'enabled': False,
+            'batch_size': batch_size,
+            'command_count': 0,
+            'marker_count': 0,
+            'markers': [],
+        }
+
+    markers, batch_size = build_progress_marker_plan(total_commands, batch_size, baseline_pair=baseline_pair)
+    output_lines = ["; bambucuts progress start"]
+    completed_commands = 0
+    marker_index = 0
+
+    for line in lines:
+        output_lines.append(line)
+
+        if not is_executable_gcode_line(line):
+            continue
+
+        completed_commands += 1
+        if completed_commands % batch_size == 0 or completed_commands == total_commands:
+            marker_index += 1
+            marker = markers[marker_index - 1]
+            output_lines.extend(progress_marker_lines(
+                completed_commands,
+                total_commands,
+                marker,
+            ))
+
+    return '\n'.join(output_lines), {
+        'enabled': True,
+        'batch_size': batch_size,
+        'command_count': total_commands,
+        'marker_count': marker_index,
+        'markers': markers,
+    }
+
+
+def begin_direct_job(progress_info):
+    """Start tracking a direct-send job by its M73 checkpoints."""
+    started_at = time.time()
+    job = {
+        'id': str(int(started_at * 1000)),
+        'active': True,
+        'status': 'queueing',
+        'started_at': started_at,
+        'completed_at': None,
+        'queued_at': None,
+        'queued_count': 0,
+        'command_count': progress_info.get('command_count', 0),
+        'marker_count': progress_info.get('marker_count', 0),
+        'markers': progress_info.get('markers', []),
+        'batch_size': progress_info.get('batch_size', PROGRESS_BATCH_SIZE),
+        'last_marker_index': 0,
+        'logical_percent': 0,
+        'last_percent': None,
+        'last_remaining_time': None,
+        'last_update': None,
+        'message': 'Queueing G-code and waiting for M73 checkpoints',
+    }
+
+    with mqtt_status_lock:
+        cached_print = dict(state['mqtt_status'].get('print') or {})
+        cached_print['mc_percent'] = None
+        cached_print['mc_remaining_time'] = None
+        cached_print['layer_num'] = None
+        state['mqtt_status']['print'] = cached_print
+
+    with direct_job_lock:
+        state['direct_job'] = job
+
+    return job.copy()
+
+
+def mark_direct_job_queued(job_id, queued_count, errors):
+    """Record whether direct G-code was queued successfully."""
+    with direct_job_lock:
+        job = dict(state.get('direct_job') or {})
+        if job.get('id') != job_id:
+            return job
+
+        job['queued_at'] = time.time()
+        job['queued_count'] = queued_count
+        if errors:
+            job['active'] = False
+            job['status'] = 'queue_error'
+            job['message'] = 'Failed while queueing direct G-code'
+            job['errors'] = errors
+        else:
+            job['status'] = 'waiting'
+            job['message'] = 'Queued; waiting for printer to reach M73 checkpoints'
+
+        state['direct_job'] = job
+        return job.copy()
+
+
+def update_direct_job_from_mqtt(mqtt_progress):
+    """Update the active direct job from cached MQTT M73 progress."""
+    with direct_job_lock:
+        job = dict(state.get('direct_job') or {})
+
+        if not job.get('active'):
+            return job
+
+        progress_update = mqtt_progress.get('last_update')
+        percent = mqtt_progress.get('percent')
+        remaining_time = mqtt_progress.get('remaining_time')
+        if progress_update is None or progress_update < job.get('started_at', 0) or percent is None:
+            return job
+
+        marker_pairs = {
+            (marker.get('percent'), marker.get('remaining')): marker.get('index')
+            for marker in job.get('markers', [])
+        }
+        marker_index = marker_pairs.get((percent, remaining_time))
+        if marker_index is None:
+            return job
+
+        previous_marker_index = job.get('last_marker_index') or 0
+        if marker_index < previous_marker_index:
+            return job
+
+        marker_count = job.get('marker_count') or 0
+        job['last_percent'] = percent
+        job['last_remaining_time'] = remaining_time
+        job['last_marker_index'] = marker_index
+        job['logical_percent'] = round((marker_index / marker_count) * 100) if marker_count else 0
+        job['last_update'] = progress_update
+
+        if marker_count and marker_index >= marker_count:
+            job['active'] = False
+            job['status'] = 'complete'
+            job['completed_at'] = progress_update
+            job['message'] = 'Direct G-code execution reached final M73 checkpoint'
+        else:
+            job['status'] = 'running'
+            job['message'] = f'Direct G-code reached checkpoint {marker_index}/{marker_count}'
+
+        state['direct_job'] = job
+        return job.copy()
+
+
+def _bounded_query_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(request.args.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _bounded_query_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(request.args.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _query_bool(name: str, default: bool = False) -> bool:
+    raw = request.args.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 # Routes
 
 @app.route('/')
@@ -305,6 +727,34 @@ def get_status():
         except Exception as e:
             print(f"Error getting printer state: {e}")
 
+    with mqtt_status_lock:
+        mqtt_status = {
+            'connected': state['mqtt_status'].get('connected'),
+            'error': state['mqtt_status'].get('error'),
+            'last_update': state['mqtt_status'].get('last_update'),
+            'print': dict(state['mqtt_status'].get('print') or {}),
+        }
+
+    mqtt_print = mqtt_status['print']
+    last_update = mqtt_status.get('last_update')
+    mqtt_progress = {
+        'percent': mqtt_print.get('mc_percent'),
+        'remaining_time': mqtt_print.get('mc_remaining_time'),
+        'layer_num': mqtt_print.get('layer_num'),
+        'total_layer_num': mqtt_print.get('total_layer_num'),
+        'print_line_number': mqtt_print.get('mc_print_line_number'),
+        'print_stage': mqtt_print.get('mc_print_stage'),
+        'print_sub_stage': mqtt_print.get('mc_print_sub_stage'),
+        'gcode_state': mqtt_print.get('gcode_state'),
+        'print_type': mqtt_print.get('print_type'),
+        'last_update': last_update,
+        'age': (time.time() - last_update) if last_update else None,
+        'mqtt_connected': mqtt_status.get('connected'),
+        'mqtt_error': mqtt_status.get('error'),
+    }
+
+    direct_job = update_direct_job_from_mqtt(mqtt_progress)
+
     return jsonify({
         'position': state['position'],
         'step_size': state['step_size'],
@@ -312,9 +762,85 @@ def get_status():
         'connection_error': state['connection_error'],
         'printer_ip': config._config_data.get('ip', ''),
         'printer_state': printer_state,
+        'mqtt_progress': mqtt_progress,
+        'mqtt_status': mqtt_status,
+        'direct_job': direct_job,
         'camera_streaming': state['camera_streaming'],
         'camera_alive': camera_alive
     })
+
+
+@app.route('/api/mqtt-dump', methods=['GET'])
+def mqtt_dump_endpoint():
+    """Dump raw Bambu MQTT report messages for debugging printer telemetry."""
+    try:
+        from bambucuts.mqtt_dump import MqttDumpError, dump_mqtt
+    except ImportError as e:
+        return jsonify({
+            'success': False,
+            'error': f'MQTT dump requires paho-mqtt: {e}',
+        }), 500
+
+    cfg = config.get_config()
+    seconds = _bounded_query_float('seconds', 5.0, 0.1, 30.0)
+    count = _bounded_query_int('count', 5, 0, 50)
+    no_pushall = _query_bool('no_pushall', False)
+
+    try:
+        dump = dump_mqtt(
+            cfg.get('ip', ''),
+            cfg.get('access_code', ''),
+            cfg.get('serial', ''),
+            duration=seconds,
+            max_messages=count,
+            request_pushall=not no_pushall,
+        )
+        return jsonify(dump)
+    except MqttDumpError as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+        }), 500
+
+
+@app.route('/api/mqtt-stream', methods=['GET'])
+def mqtt_stream_endpoint():
+    """Stream raw Bambu MQTT report messages as newline-delimited JSON."""
+    try:
+        from bambucuts.mqtt_dump import MqttDumpError, stream_mqtt
+    except ImportError as e:
+        return jsonify({
+            'success': False,
+            'error': f'MQTT stream requires paho-mqtt: {e}',
+        }), 500
+
+    cfg = config.get_config()
+    seconds = _bounded_query_float('seconds', 60.0, 1.0, 300.0)
+    count = _bounded_query_int('count', 0, 0, 1000)
+    no_pushall = _query_bool('no_pushall', False)
+
+    def generate():
+        try:
+            for event in stream_mqtt(
+                cfg.get('ip', ''),
+                cfg.get('access_code', ''),
+                cfg.get('serial', ''),
+                duration=seconds,
+                max_messages=count,
+                request_pushall=not no_pushall,
+            ):
+                yield json.dumps(event, sort_keys=True) + "\n"
+        except MqttDumpError as e:
+            yield json.dumps({
+                "type": "error",
+                "error": str(e),
+            }, sort_keys=True) + "\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='application/x-ndjson',
+        headers={'X-Accel-Buffering': 'no'},
+    )
 
 
 @app.route('/api/history', methods=['GET'])
@@ -675,24 +1201,34 @@ def send_all_gcode():
     """Send all G-code lines from editor."""
     data = request.json
     gcode_text = data.get('gcode', '')
+    progress_markers = data.get('progress_markers', True)
+    progress_batch_size = clamp_progress_batch_size(data.get('progress_batch_size', PROGRESS_BATCH_SIZE))
 
     if not gcode_text.strip():
         return jsonify({'success': False, 'error': 'No G-code to send'}), 400
 
+    progress_info = {
+        'enabled': False,
+        'batch_size': progress_batch_size,
+        'command_count': sum(1 for _ in extract_executable_gcode(gcode_text)),
+        'marker_count': 0,
+    }
+    gcode_to_send = gcode_text
+    if progress_markers:
+        gcode_to_send, progress_info = add_m73_progress_markers(
+            gcode_text,
+            progress_batch_size,
+            baseline_pair=current_mqtt_marker_pair(),
+        )
+
     sent_count = 0
+    queued_count = 0
     errors = []
+    direct_job = None
+    if state['printer_connected'] and progress_info.get('enabled'):
+        direct_job = begin_direct_job(progress_info)
 
-    for line_num, line in enumerate(gcode_text.split('\n'), 1):
-        line = line.strip()
-
-        # Skip empty lines and comments
-        if not line or line.startswith(';'):
-            continue
-
-        # Remove inline comments
-        if ';' in line:
-            line = line.split(';')[0].strip()
-
+    for line_num, line in extract_executable_gcode(gcode_to_send):
         # Add to history
         add_to_history(line)
 
@@ -702,12 +1238,20 @@ def send_all_gcode():
             if not success:
                 errors.append(f"Line {line_num}: Failed to send")
 
-        sent_count += 1
+        queued_count += 1
+        if not line.upper().startswith(('M73', 'M400')):
+            sent_count += 1
         time.sleep(0.05)  # Small delay between commands
+
+    if direct_job:
+        direct_job = mark_direct_job_queued(direct_job['id'], queued_count, errors)
 
     return jsonify({
         'success': len(errors) == 0,
         'sent_count': sent_count,
+        'queued_count': queued_count,
+        'progress': progress_info,
+        'direct_job': direct_job,
         'errors': errors
     })
 
@@ -718,6 +1262,8 @@ def send_all_gcode_3mf():
     data = request.json
     gcode_text = data.get('gcode', '')
     filename = data.get('filename', 'plot.gcode')
+    progress_markers = data.get('progress_markers', True)
+    progress_batch_size = clamp_progress_batch_size(data.get('progress_batch_size', PROGRESS_BATCH_SIZE))
 
     if not gcode_text.strip():
         return jsonify({'success': False, 'error': 'No G-code to send'}), 400
@@ -731,10 +1277,24 @@ def send_all_gcode_3mf():
     temp_3mf_path = None
 
     try:
+        progress_info = {
+            'enabled': False,
+            'batch_size': progress_batch_size,
+            'command_count': sum(1 for _ in extract_executable_gcode(gcode_text)),
+            'marker_count': 0,
+        }
+        gcode_to_package = gcode_text
+        if progress_markers:
+            gcode_to_package, progress_info = add_m73_progress_markers(
+                gcode_text,
+                progress_batch_size,
+                baseline_pair=current_mqtt_marker_pair(),
+            )
+
         # Save G-code to temporary file
         temp_gcode_path = os.path.join(temp_dir, 'temp_plot.gcode')
         with open(temp_gcode_path, 'w') as f:
-            f.write(gcode_text)
+            f.write(gcode_to_package)
 
         # Convert to 3MF using template
         template_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -764,7 +1324,8 @@ def send_all_gcode_3mf():
         return jsonify({
             'success': True,
             'message': f'Successfully uploaded and started printing {output_3mf_name}',
-            'filename': output_3mf_name
+            'filename': output_3mf_name,
+            'progress': progress_info
         })
 
     except Exception as e:
@@ -790,6 +1351,8 @@ def create_3mf():
     data = request.json
     gcode_text = data.get('gcode', '')
     filename = data.get('filename', 'plot.gcode')
+    progress_markers = data.get('progress_markers', True)
+    progress_batch_size = clamp_progress_batch_size(data.get('progress_batch_size', PROGRESS_BATCH_SIZE))
 
     if not gcode_text.strip():
         return jsonify({'success': False, 'error': 'No G-code to convert'}), 400
@@ -800,10 +1363,18 @@ def create_3mf():
     temp_3mf_path = None
 
     try:
+        gcode_to_package = gcode_text
+        if progress_markers:
+            gcode_to_package, _ = add_m73_progress_markers(
+                gcode_text,
+                progress_batch_size,
+                baseline_pair=current_mqtt_marker_pair(),
+            )
+
         # Save G-code to temporary file
         temp_gcode_path = os.path.join(temp_dir, 'temp_plot.gcode')
         with open(temp_gcode_path, 'w') as f:
-            f.write(gcode_text)
+            f.write(gcode_to_package)
 
         # Convert to 3MF using template
         template_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -978,6 +1549,47 @@ def camera_status():
     })
 
 
+@app.route('/api/camera/frame', methods=['GET'])
+def camera_frame():
+    """Return the latest cached camera frame for the web UI."""
+    if not state['printer_connected']:
+        return jsonify({'success': False, 'error': 'Printer not connected'}), 400
+
+    with camera_frame_lock:
+        frame = latest_camera_frame
+        frame_time = latest_camera_frame_time
+
+    if frame:
+        return jsonify({
+            'success': True,
+            'frame': frame,
+            'age': time.time() - frame_time if frame_time else None,
+            'streaming': state['camera_streaming']
+        })
+
+    camera_error = None
+    if printer:
+        try:
+            frame = process_camera_frame(printer.get_camera_frame())
+            remember_camera_frame(frame)
+            return jsonify({
+                'success': True,
+                'frame': frame,
+                'age': 0,
+                'streaming': state['camera_streaming']
+            })
+        except Exception as e:
+            camera_error = str(e)
+
+    status_code = 202 if state['camera_streaming'] else 404
+    return jsonify({
+        'success': False,
+        'status': 'warming_up' if state['camera_streaming'] else 'no_frame',
+        'error': camera_error,
+        'streaming': state['camera_streaming']
+    }), status_code
+
+
 # WebSocket handlers
 @socketio.on('connect')
 def handle_connect():
@@ -1000,6 +1612,7 @@ def handle_frame_request():
             frame = printer.get_camera_frame()
             if frame:
                 processed_frame = process_camera_frame(frame)
+                remember_camera_frame(processed_frame)
                 emit('camera_frame', {'frame': processed_frame})
         except Exception as e:
             print(f"Error getting camera frame: {e}")
