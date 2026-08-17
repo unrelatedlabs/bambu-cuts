@@ -38,7 +38,7 @@ import pwmio
 
 # Try board.LED first; if it doesn't exist, manually set GPIO15
 
-led = digitalio.DigitalInOut(board.D15)
+led = digitalio.DigitalInOut(board.IO15)
 led2a = digitalio.DigitalInOut(microcontroller.pin.GPIO6)
 
 # Create a PWM output on GPIO39 at 1 kHz
@@ -107,7 +107,7 @@ rx.pull = digitalio.Pull.UP
 rx.deinit()  # release it so UART
 
 uart = busio.UART(
-    board.D17, microcontroller.pin.GPIO1,
+    board.IO17, microcontroller.pin.GPIO1,
     baudrate=1228800,
     parity=busio.UART.Parity.EVEN,
     bits=8,
@@ -190,6 +190,7 @@ def process_packet(payload):
             
     except e:
         print(e)
+        
         
     
 def process_frame(buf: bytearray) -> bool:

@@ -75,6 +75,19 @@ def _decode_payload(payload: bytes) -> tuple[str, Optional[Any]]:
         return text, None
 
 
+def _wait_first(timeout: float, *events: threading.Event) -> Optional[threading.Event]:
+    """Wait until one of the events is set. Returns that event, or None on timeout."""
+    deadline = time.monotonic() + timeout
+    while True:
+        for event in events:
+            if event.is_set():
+                return event
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(0.05, remaining))
+
+
 def _pushall_payload(sequence_id: str) -> str:
     return json.dumps({
         "pushing": {
@@ -294,7 +307,12 @@ def listen_mqtt_reports(
     port: int = BAMBU_MQTT_PORT,
     connect_timeout: float = 10.0,
 ) -> None:
-    """Listen to MQTT reports until stop_event is set."""
+    """Listen to MQTT reports until stop_event is set.
+
+    stop_event belongs to the caller and is only ever read here: a failed or
+    dropped connection ends this session by raising MqttDumpError, so a caller
+    looping on stop_event can reconnect instead of being shut down for good.
+    """
     ip = (ip or "").strip()
     access_code = (access_code or "").strip()
     serial = (serial or "").strip()
@@ -313,6 +331,9 @@ def listen_mqtt_reports(
     client_id = f"bambucuts-status-{uuid.uuid4().hex[:8]}"
     errors: List[str] = []
     connected = threading.Event()
+    # Set when this connection dies. Session-scoped on purpose: setting the
+    # caller's stop_event here would end their listen loop permanently.
+    session_over = threading.Event()
 
     client = _new_client(client_id)
     client.username_pw_set(BAMBU_MQTT_USERNAME, access_code)
@@ -322,7 +343,7 @@ def listen_mqtt_reports(
     def on_connect(client, userdata, flags, rc):
         if rc != 0:
             errors.append(f"MQTT connect failed with rc={rc}")
-            stop_event.set()
+            session_over.set()
             return
 
         connected.set()
@@ -345,7 +366,7 @@ def listen_mqtt_reports(
     def on_disconnect(client, userdata, rc):
         if rc != 0 and not stop_event.is_set():
             errors.append(f"MQTT disconnected with rc={rc}")
-            stop_event.set()
+        session_over.set()
 
     client.on_connect = on_connect
     client.on_message = handle_paho_message
@@ -355,13 +376,17 @@ def listen_mqtt_reports(
         client.connect(ip, int(port), keepalive=60)
         client.loop_start()
 
-        if not connected.wait(connect_timeout):
+        outcome = _wait_first(connect_timeout, connected, session_over, stop_event)
+        if outcome is stop_event:
+            return
+        if outcome is not connected:
             if errors:
                 raise MqttDumpError(errors[-1])
             raise MqttDumpError(f"Timed out connecting to MQTT at {ip}:{port}")
 
         while not stop_event.wait(0.25):
-            pass
+            if session_over.is_set():
+                raise MqttDumpError(errors[-1] if errors else "MQTT connection lost")
     except OSError as exc:
         raise MqttDumpError(f"MQTT connection error: {exc}") from exc
     finally:

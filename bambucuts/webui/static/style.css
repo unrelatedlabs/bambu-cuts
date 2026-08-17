@@ -129,6 +129,14 @@ header h1 {
     color: var(--success);
 }
 
+.status-box.warning {
+    border-color: var(--warning);
+}
+
+.status-box.warning #statusText {
+    color: var(--warning);
+}
+
 .status-box.disconnected {
     border-color: var(--danger);
 }

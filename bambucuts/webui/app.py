@@ -21,6 +21,7 @@ from pathlib import Path
 import threading
 import base64
 import math
+import uuid
 from io import BytesIO
 
 try:
@@ -59,15 +60,34 @@ state = {
     'direct_job': {
         'active': False,
         'status': 'idle'
-    }
+    },
+    # History of direct-send jobs keyed by their UUID, most recent last.
+    'direct_jobs': {}
 }
+
+# How many finished direct jobs to keep queryable by UUID.
+DIRECT_JOB_HISTORY_LIMIT = 50
 
 # Printer instance
 printer = None
 
 # Direct-send progress markers. Each marker is queued after an M400, so MQTT
-# progress reflects completed motion up to that batch.
+# progress reflects completed motion up to that batch. Marker percents form a
+# wrapping counter (+1 per batch, mod 100) starting from the printer's current
+# mc_percent, so every checkpoint produces a fresh MQTT delta.
 PROGRESS_BATCH_SIZE = 25
+
+# The printer reports status every couple of seconds, so a feed with nothing
+# newer than this is dead even if the cached 'connected' flag says otherwise.
+MQTT_STALE_SECONDS = 30.0
+
+# How long to wait before rebuilding a dropped MQTT status connection.
+MQTT_RECONNECT_DELAY = 5.0
+
+# Give up on a queued direct job that has not reached its next M73 checkpoint
+# within this many seconds. Generous: one batch of slow F240 moves can run for
+# minutes before the checkpoint lands.
+DIRECT_JOB_STALL_SECONDS = 300.0
 
 # Camera streaming control
 camera_thread = None
@@ -136,8 +156,15 @@ def _merge_mqtt_print_status(print_status):
     if not isinstance(print_status, dict):
         return
 
+    progress_keys = ('mc_percent', 'mc_remaining_time', 'layer_num', 'total_layer_num', 'gcode_state')
+
     with mqtt_status_lock:
         cached_print = dict(state['mqtt_status'].get('print') or {})
+        changes = {
+            key: (cached_print.get(key), print_status[key])
+            for key in progress_keys
+            if key in print_status and cached_print.get(key) != print_status[key]
+        }
         cached_print.update(print_status)
         state['mqtt_status'] = {
             'connected': True,
@@ -145,6 +172,10 @@ def _merge_mqtt_print_status(print_status):
             'last_update': time.time(),
             'print': cached_print
         }
+
+    if changes:
+        summary = ', '.join(f"{key}: {old} -> {new}" for key, (old, new) in changes.items())
+        print(f"Printer progress changed: {summary}")
 
 
 def _handle_mqtt_status_message(message):
@@ -154,6 +185,49 @@ def _handle_mqtt_status_message(message):
 
     print_status = payload.get('print')
     _merge_mqtt_print_status(print_status)
+
+
+def _record_mqtt_feed_down(error):
+    """Mark the cached MQTT status as disconnected, keeping the last print data."""
+    with mqtt_status_lock:
+        cached_print = dict(state['mqtt_status'].get('print') or {})
+        state['mqtt_status'] = {
+            'connected': False,
+            'error': error,
+            'last_update': state['mqtt_status'].get('last_update'),
+            'print': cached_print
+        }
+    if error:
+        print(f"MQTT status feed down: {error}")
+
+
+def mqtt_feed_health(last_update):
+    """Report whether the MQTT status feed is actually live.
+
+    The cached 'connected' flag only records that a message once arrived, so a
+    listener that died silently keeps looking healthy. Treat a feed with no
+    recent message as down regardless of the flag.
+    """
+    age = (time.time() - last_update) if last_update else None
+    listener_alive = bool(mqtt_status_thread and mqtt_status_thread.is_alive())
+    stale = age is None or age > MQTT_STALE_SECONDS
+
+    if stale:
+        if age is None:
+            reason = 'No MQTT status received yet'
+        else:
+            reason = f'No MQTT status for {age:.0f}s'
+        if not listener_alive:
+            reason += ' (listener not running)'
+    else:
+        reason = None
+
+    return {
+        'age': age,
+        'stale': stale,
+        'listener_alive': listener_alive,
+        'reason': reason,
+    }
 
 
 def start_mqtt_status_monitor():
@@ -187,17 +261,17 @@ def start_mqtt_status_monitor():
                     stop_event=mqtt_status_stop_event,
                     request_pushall=True,
                 )
+                # Returned without error: either we were asked to stop, or the
+                # session ended quietly. Either way, reconnect below.
+                _record_mqtt_feed_down(None if mqtt_status_stop_event.is_set() else 'MQTT session ended')
             except MqttDumpError as e:
-                with mqtt_status_lock:
-                    cached_print = dict(state['mqtt_status'].get('print') or {})
-                    state['mqtt_status'] = {
-                        'connected': False,
-                        'error': str(e),
-                        'last_update': state['mqtt_status'].get('last_update'),
-                        'print': cached_print
-                    }
-                if not mqtt_status_stop_event.wait(5):
-                    continue
+                _record_mqtt_feed_down(str(e))
+            except Exception as e:  # never let the listener thread die silently
+                _record_mqtt_feed_down(f'MQTT status listener error: {e}')
+
+            if mqtt_status_stop_event.wait(MQTT_RECONNECT_DELAY):
+                break
+            print("Reconnecting MQTT status listener...")
 
     mqtt_status_thread = threading.Thread(target=worker, daemon=True)
     mqtt_status_thread.start()
@@ -399,7 +473,9 @@ def send_gcode_to_printer(gcode: str) -> bool:
         return False
 
     try:
-        printer.gcode(gcode)
+        # gcode_check=False: the library's validator rejects bare axis flags
+        # (e.g. "G28 X"), so skip it and let the printer do the validating.
+        printer.gcode(gcode, gcode_check=False)
         print(f"G-code sent to printer: {gcode}")
         return True
     except Exception as e:
@@ -451,75 +527,36 @@ def current_mqtt_marker_pair():
         )
 
 
-def _scaled_marker_percents(marker_count: int, mode: str = 'normal'):
-    if marker_count == 1:
-        if mode == 'lower':
-            return [99]
-        if mode == 'upper':
-            return [2]
-        return [100]
-
-    if mode == 'lower':
-        return [max(1, math.floor(index * 99 / marker_count)) for index in range(1, marker_count + 1)]
-    if mode == 'upper':
-        return [
-            2 + math.floor((index - 1) * 98 / (marker_count - 1))
-            for index in range(1, marker_count + 1)
-        ]
-    return [max(1, math.floor(index * 100 / marker_count)) for index in range(1, marker_count + 1)]
-
-
 def build_progress_marker_plan(total_commands: int, requested_batch_size: int, baseline_pair=None):
-    """Build unique M73 checkpoint pairs, avoiding the cached baseline value."""
+    """Build M73 checkpoints as a wrapping counter: +1 percent per batch.
+
+    Checkpoint i reports P((start + i) % 100) where start is the printer's
+    current mc_percent. Consecutive checkpoints always differ, so each one
+    produces a fresh MQTT delta, and progress tracking simply counts up,
+    wrapping past 99 back to 0 for jobs with more than 99 batches.
+    """
     if total_commands <= 0:
-        return [], requested_batch_size
+        return [], requested_batch_size, 0
 
     batch_size = max(1, requested_batch_size)
     marker_count = math.ceil(total_commands / batch_size)
-    if marker_count > 99:
-        batch_size = math.ceil(total_commands / 99)
-        marker_count = math.ceil(total_commands / batch_size)
 
-    baseline_pair = baseline_pair or (None, None)
-    candidate_modes = [
-        ('normal', 0),
-        ('lower', 0),
-        ('upper', 0),
-        ('normal', 1),
-        ('lower', 1),
-        ('upper', 1),
-    ]
+    baseline_percent = (baseline_pair or (None, None))[0]
+    try:
+        start_percent = int(baseline_percent) % 100
+    except (TypeError, ValueError):
+        start_percent = 0
 
-    for percent_mode, remaining_offset in candidate_modes:
-        percents = _scaled_marker_percents(marker_count, mode=percent_mode)
-        pairs = [
-            (percent, marker_count - index + remaining_offset)
-            for index, percent in enumerate(percents, 1)
-        ]
-        if len(set(pairs)) != len(pairs):
-            continue
-        if pairs[0] == baseline_pair or pairs[-1] == baseline_pair:
-            continue
-
-        return [
-            {
-                'index': index,
-                'percent': percent,
-                'remaining': remaining,
-            }
-            for index, (percent, remaining) in enumerate(pairs, 1)
-        ], batch_size
-
-    # This should be unreachable for marker_count <= 100, but keep a safe fallback.
-    percents = _scaled_marker_percents(marker_count, mode='lower')
-    return [
+    markers = [
         {
             'index': index,
-            'percent': percent,
-            'remaining': marker_count - index + 1,
+            'percent': (start_percent + index) % 100,
+            'remaining': 0,
+            'completed': False,
         }
-        for index, percent in enumerate(percents, 1)
-    ], batch_size
+        for index in range(1, marker_count + 1)
+    ]
+    return markers, batch_size, start_percent
 
 
 def progress_marker_lines(completed_commands: int, total_commands: int, marker):
@@ -548,9 +585,11 @@ def add_m73_progress_markers(gcode_text: str, batch_size: int = PROGRESS_BATCH_S
             'command_count': 0,
             'marker_count': 0,
             'markers': [],
+            'start_percent': 0,
         }
 
-    markers, batch_size = build_progress_marker_plan(total_commands, batch_size, baseline_pair=baseline_pair)
+    markers, batch_size, start_percent = build_progress_marker_plan(
+        total_commands, batch_size, baseline_pair=baseline_pair)
     output_lines = ["; bambucuts progress start"]
     completed_commands = 0
     marker_index = 0
@@ -577,14 +616,23 @@ def add_m73_progress_markers(gcode_text: str, batch_size: int = PROGRESS_BATCH_S
         'command_count': total_commands,
         'marker_count': marker_index,
         'markers': markers,
+        'start_percent': start_percent,
     }
+
+
+def _store_direct_job(job):
+    """Store a job in the UUID-keyed history, trimming old entries. Caller holds direct_job_lock."""
+    jobs = state.setdefault('direct_jobs', {})
+    jobs[job['id']] = job
+    while len(jobs) > DIRECT_JOB_HISTORY_LIMIT:
+        del jobs[next(iter(jobs))]
 
 
 def begin_direct_job(progress_info):
     """Start tracking a direct-send job by its M73 checkpoints."""
     started_at = time.time()
     job = {
-        'id': str(int(started_at * 1000)),
+        'id': str(uuid.uuid4()),
         'active': True,
         'status': 'queueing',
         'started_at': started_at,
@@ -593,8 +641,9 @@ def begin_direct_job(progress_info):
         'queued_count': 0,
         'command_count': progress_info.get('command_count', 0),
         'marker_count': progress_info.get('marker_count', 0),
-        'markers': progress_info.get('markers', []),
+        'markers': [dict(marker) for marker in progress_info.get('markers', [])],
         'batch_size': progress_info.get('batch_size', PROGRESS_BATCH_SIZE),
+        'start_percent': progress_info.get('start_percent', 0),
         'last_marker_index': 0,
         'logical_percent': 0,
         'last_percent': None,
@@ -602,6 +651,16 @@ def begin_direct_job(progress_info):
         'last_update': None,
         'message': 'Queueing G-code and waiting for M73 checkpoints',
     }
+
+    shown = job['markers'] if len(job['markers']) <= 8 else job['markers'][:7] + job['markers'][-1:]
+    expected = ', '.join(
+        f"#{marker['index']}: P{marker['percent']}"
+        for marker in shown
+    )
+    if len(job['markers']) > 8:
+        expected = expected.replace(f", #{job['markers'][-1]['index']}:", f", ..., #{job['markers'][-1]['index']}:")
+    print(f"Direct job {job['id']} started: {job['command_count']} command(s), "
+          f"expecting {job['marker_count']} M73 checkpoint(s): {expected}")
 
     with mqtt_status_lock:
         cached_print = dict(state['mqtt_status'].get('print') or {})
@@ -611,7 +670,14 @@ def begin_direct_job(progress_info):
         state['mqtt_status']['print'] = cached_print
 
     with direct_job_lock:
+        previous = dict(state.get('direct_job') or {})
+        if previous.get('active') and previous.get('id'):
+            previous['active'] = False
+            previous['status'] = 'superseded'
+            previous['message'] = 'Superseded by a newer direct job'
+            _store_direct_job(previous)
         state['direct_job'] = job
+        _store_direct_job(job)
 
     return job.copy()
 
@@ -635,7 +701,37 @@ def mark_direct_job_queued(job_id, queued_count, errors):
             job['message'] = 'Queued; waiting for printer to reach M73 checkpoints'
 
         state['direct_job'] = job
+        _store_direct_job(job)
         return job.copy()
+
+
+def _apply_stall_timeout(job, mqtt_progress):
+    """Fail a queued job that waited too long for its next checkpoint.
+
+    Without this a job whose checkpoints never arrive - a dead MQTT feed, a
+    cancelled print - stays 'active' forever. Caller holds direct_job_lock.
+    """
+    queued_at = job.get('queued_at')
+    if not job.get('active') or not queued_at:
+        return job
+
+    waited = time.time() - (job.get('last_update') or queued_at)
+    if waited < DIRECT_JOB_STALL_SECONDS:
+        return job
+
+    marker_index = job.get('last_marker_index') or 0
+    marker_count = job.get('marker_count') or 0
+    reason = mqtt_progress.get('stale_reason') or f'no checkpoint for {waited:.0f}s'
+
+    job['active'] = False
+    job['status'] = 'stalled'
+    job['completed_at'] = time.time()
+    job['message'] = f'Stopped waiting at checkpoint {marker_index}/{marker_count}: {reason}'
+    print(f"Direct job {job.get('id')} stalled: {job['message']}")
+
+    state['direct_job'] = job
+    _store_direct_job(job)
+    return job.copy()
 
 
 def update_direct_job_from_mqtt(mqtt_progress):
@@ -649,22 +745,36 @@ def update_direct_job_from_mqtt(mqtt_progress):
         progress_update = mqtt_progress.get('last_update')
         percent = mqtt_progress.get('percent')
         remaining_time = mqtt_progress.get('remaining_time')
+        if mqtt_progress.get('stale'):
+            return _apply_stall_timeout(job, mqtt_progress)
         if progress_update is None or progress_update < job.get('started_at', 0) or percent is None:
-            return job
+            return _apply_stall_timeout(job, mqtt_progress)
 
-        marker_pairs = {
-            (marker.get('percent'), marker.get('remaining')): marker.get('index')
-            for marker in job.get('markers', [])
-        }
-        marker_index = marker_pairs.get((percent, remaining_time))
-        if marker_index is None:
-            return job
-
-        previous_marker_index = job.get('last_marker_index') or 0
-        if marker_index < previous_marker_index:
-            return job
+        # Checkpoint percents form a wrapping counter: percent = (start + index)
+        # % 100. Resolve the reported percent to the nearest checkpoint at or
+        # after the last one seen, so progress only ever counts up. Our M73
+        # markers always send R0, so a nonzero remaining time is not ours.
+        if remaining_time is not None and remaining_time != 0:
+            return _apply_stall_timeout(job, mqtt_progress)
 
         marker_count = job.get('marker_count') or 0
+        start_percent = job.get('start_percent') or 0
+        previous_marker_index = job.get('last_marker_index') or 0
+
+        steps_ahead = (percent - start_percent - previous_marker_index) % 100
+        if steps_ahead == 0:
+            return _apply_stall_timeout(job, mqtt_progress)
+        marker_index = previous_marker_index + steps_ahead
+        if marker_index > marker_count:
+            return _apply_stall_timeout(job, mqtt_progress)
+
+        markers = [dict(marker) for marker in job.get('markers', [])]
+        for marker in markers[:marker_index]:
+            marker['completed'] = True
+        job['markers'] = markers
+
+        print(f"Checkpoint {marker_index}/{marker_count} reached "
+              f"(printer reported P{percent} R{remaining_time})")
         job['last_percent'] = percent
         job['last_remaining_time'] = remaining_time
         job['last_marker_index'] = marker_index
@@ -676,11 +786,13 @@ def update_direct_job_from_mqtt(mqtt_progress):
             job['status'] = 'complete'
             job['completed_at'] = progress_update
             job['message'] = 'Direct G-code execution reached final M73 checkpoint'
+            print("Done.")
         else:
             job['status'] = 'running'
             job['message'] = f'Direct G-code reached checkpoint {marker_index}/{marker_count}'
 
         state['direct_job'] = job
+        _store_direct_job(job)
         return job.copy()
 
 
@@ -737,6 +849,13 @@ def get_status():
 
     mqtt_print = mqtt_status['print']
     last_update = mqtt_status.get('last_update')
+    health = mqtt_feed_health(last_update)
+    # A stale feed is a dead feed, whatever the cached flag says.
+    mqtt_live = bool(mqtt_status.get('connected')) and not health['stale']
+    mqtt_status['connected'] = mqtt_live
+    mqtt_status['stale'] = health['stale']
+    if health['stale'] and not mqtt_status.get('error'):
+        mqtt_status['error'] = health['reason']
     mqtt_progress = {
         'percent': mqtt_print.get('mc_percent'),
         'remaining_time': mqtt_print.get('mc_remaining_time'),
@@ -748,8 +867,11 @@ def get_status():
         'gcode_state': mqtt_print.get('gcode_state'),
         'print_type': mqtt_print.get('print_type'),
         'last_update': last_update,
-        'age': (time.time() - last_update) if last_update else None,
-        'mqtt_connected': mqtt_status.get('connected'),
+        'age': health['age'],
+        'stale': health['stale'],
+        'stale_reason': health['reason'],
+        'listener_alive': health['listener_alive'],
+        'mqtt_connected': mqtt_live,
         'mqtt_error': mqtt_status.get('error'),
     }
 
@@ -931,6 +1053,48 @@ def home_xy():
     })
 
 
+@app.route('/api/set-xy-zero', methods=['POST'])
+def set_xy_zero():
+    """Set current X and Y position as zero."""
+    state['position']['x'] = 0.0
+    state['position']['y'] = 0.0
+
+    gcode = "G92 X0 Y0"
+    add_to_history(gcode)
+
+    success = True
+    if state['printer_connected']:
+        success = send_gcode_to_printer(gcode)
+
+    return jsonify({
+        'success': success,
+        'position': state['position'],
+        'gcode': gcode
+    })
+
+
+@app.route('/api/set-xyze-zero', methods=['POST'])
+def set_xyze_zero():
+    """Set current X, Y, Z and E positions as zero."""
+    state['position']['x'] = 0.0
+    state['position']['y'] = 0.0
+    state['position']['z'] = 0.0
+    state['position']['e'] = 0.0
+
+    gcode = "G92 X0 Y0 Z0 E0"
+    add_to_history(gcode)
+
+    success = True
+    if state['printer_connected']:
+        success = send_gcode_to_printer(gcode)
+
+    return jsonify({
+        'success': success,
+        'position': state['position'],
+        'gcode': gcode
+    })
+
+
 @app.route('/api/save-z-zero', methods=['POST'])
 def save_z_zero():
     """Save current Z position as zero."""
@@ -998,6 +1162,19 @@ def move_z_absolute():
     })
 
 
+@app.route('/api/mqtt-pushall', methods=['POST'])
+def mqtt_pushall():
+    """Ask the printer for an immediate full status push (throttle callers:
+    Bambu rate-limits pushall)."""
+    if not state['printer_connected'] or not printer:
+        return jsonify({'success': False, 'error': 'printer not connected'}), 400
+    try:
+        ok = printer.mqtt_client.pushall()
+        return jsonify({'success': bool(ok)})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/gcode', methods=['POST'])
 def execute_gcode():
     """Execute custom G-code command."""
@@ -1013,31 +1190,51 @@ def execute_gcode():
     if state['printer_connected']:
         success = send_gcode_to_printer(gcode)
 
-    # Try to parse position updates from G-code
-    gcode_upper = gcode.upper()
-    if gcode_upper.startswith('G1') or gcode_upper.startswith('G0'):
-        parts = gcode_upper.split()
-        for part in parts[1:]:
-            if part.startswith('X'):
+    # Track position from EVERY line, G90/G91-aware (multi-line safe).
+    # The absolute/relative mode persists across calls in state, matching
+    # the printer's own modal state.
+    for raw in gcode.split('\n'):
+        cmd = raw.split(';')[0].strip().upper()
+        if not cmd:
+            continue
+        if cmd == 'G90':
+            state['gcode_absolute'] = True
+            continue
+        if cmd == 'G91':
+            state['gcode_absolute'] = False
+            continue
+        if cmd.startswith('G28'):
+            # homing defines the printer origin for the homed axes
+            axes = cmd.split()[1:]
+            if not axes or any(a.startswith('X') or a.startswith('Y') for a in axes):
+                state['position']['x'] = 0.0
+                state['position']['y'] = 0.0
+            if not axes or any(a.startswith('Z') for a in axes):
+                state['position']['z'] = 0.0
+            continue
+        if cmd.startswith('G92'):
+            for part in cmd.split()[1:]:
+                ax = part[0].lower()
+                if ax in 'xyze':
+                    try:
+                        state['position'][ax] = float(part[1:] or 0.0)
+                    except ValueError:
+                        pass
+            continue
+        if cmd.startswith(('G0 ', 'G1 ')) or cmd in ('G0', 'G1'):
+            absolute = state.get('gcode_absolute', True)
+            for part in cmd.split()[1:]:
+                ax = part[0].lower()
+                if ax not in 'xyz':   # E is relative (M83) on this rig
+                    continue
                 try:
-                    state['position']['x'] = float(part[1:])
+                    val = float(part[1:])
                 except ValueError:
-                    pass
-            elif part.startswith('Y'):
-                try:
-                    state['position']['y'] = float(part[1:])
-                except ValueError:
-                    pass
-            elif part.startswith('Z'):
-                try:
-                    state['position']['z'] = float(part[1:])
-                except ValueError:
-                    pass
-            elif part.startswith('E'):
-                try:
-                    state['position']['e'] = float(part[1:])
-                except ValueError:
-                    pass
+                    continue
+                if absolute:
+                    state['position'][ax] = val
+                else:
+                    state['position'][ax] += val
 
     return jsonify({
         'success': success,
@@ -1252,8 +1449,28 @@ def send_all_gcode():
         'queued_count': queued_count,
         'progress': progress_info,
         'direct_job': direct_job,
+        'job_id': direct_job['id'] if direct_job else None,
         'errors': errors
     })
+
+
+@app.route('/api/gcode/jobs', methods=['GET'])
+def list_direct_jobs():
+    """List recent direct-send jobs with their per-batch completion status."""
+    with direct_job_lock:
+        jobs = [dict(job) for job in state.get('direct_jobs', {}).values()]
+    return jsonify({'jobs': jobs})
+
+
+@app.route('/api/gcode/jobs/<job_id>', methods=['GET'])
+def get_direct_job(job_id):
+    """Get one direct-send job by its UUID."""
+    with direct_job_lock:
+        job = state.get('direct_jobs', {}).get(job_id)
+        job = dict(job) if job else None
+    if job is None:
+        return jsonify({'success': False, 'error': 'Unknown job id'}), 404
+    return jsonify({'success': True, 'job': job})
 
 
 @app.route('/api/gcode/send-all-3mf', methods=['POST'])

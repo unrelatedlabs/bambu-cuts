@@ -80,8 +80,10 @@ function attachEventListeners() {
     document.getElementById('homeXY').addEventListener('click', homeXY);
     document.getElementById('kissZ').addEventListener('click', kissZ);
     document.getElementById('microKissZ').addEventListener('click', microKissZ);
+    document.getElementById('setXYZero').addEventListener('click', setXYZero);
     document.getElementById('saveZ').addEventListener('click', saveZZero);
     document.getElementById('resetE').addEventListener('click', resetEZero);
+    document.getElementById('setXYZEZero').addEventListener('click', setXYZEZero);
     document.getElementById('moveZ0').addEventListener('click', () => moveZAbsolute(0));
     document.getElementById('moveZ2').addEventListener('click', () => moveZAbsolute(2));
     document.getElementById('moveZ10').addEventListener('click', () => moveZAbsolute(10));
@@ -478,6 +480,52 @@ G92 Z0`;
     }
 }
 
+async function setXYZero() {
+    try {
+        const response = await fetch(`${API_BASE}/api/set-xy-zero`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+        const data = await response.json();
+        console.log('Set XY zero result:', data);
+
+        if (data.success) {
+            updatePositionDisplay(data.position);
+            updateHistory();
+            showNotification('X and Y zero set', 'success');
+        } else {
+            showNotification('Set XY zero failed', 'error');
+        }
+    } catch (error) {
+        console.error('Set XY zero error:', error);
+        showNotification('Failed to set XY zero', 'error');
+    }
+}
+
+async function setXYZEZero() {
+    try {
+        const response = await fetch(`${API_BASE}/api/set-xyze-zero`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+        const data = await response.json();
+        console.log('Set XYZE zero result:', data);
+
+        if (data.success) {
+            updatePositionDisplay(data.position);
+            updateHistory();
+            showNotification('All axes zeroed', 'success');
+        } else {
+            showNotification('Set XYZE zero failed', 'error');
+        }
+    } catch (error) {
+        console.error('Set XYZE zero error:', error);
+        showNotification('Failed to set XYZE zero', 'error');
+    }
+}
+
 async function saveZZero() {
     try {
         const response = await fetch(`${API_BASE}/api/save-z-zero`, {
@@ -756,11 +804,17 @@ function updateConnectionStatus(connected, printerIp, error, printerState, mqttP
                 statusMessage += ` / R${mqttProgress.remaining_time}`;
             }
         }
+        if (mqttProgress && mqttProgress.stale) {
+            statusBox.className = 'status-box warning';
+            statusMessage += ` - MQTT STALE (${mqttProgress.stale_reason || 'no recent status'})`;
+        }
         if (directJob && directJob.status && directJob.status !== 'idle') {
             if (directJob.status === 'complete') {
                 statusMessage += ' - Direct done';
             } else if (directJob.status === 'queue_error') {
                 statusMessage += ' - Direct queue error';
+            } else if (directJob.status === 'stalled') {
+                statusMessage += ' - Direct stalled';
             } else if (directJob.last_marker_index && directJob.logical_percent !== null && directJob.logical_percent !== undefined) {
                 statusMessage += ` - Direct ${directJob.logical_percent}% done`;
             } else if (directJob.active) {
