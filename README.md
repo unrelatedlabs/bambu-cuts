@@ -205,7 +205,14 @@ M73 P43 R0
 
 `Print Direct` has a `Single call` checkbox. Unchecked (default), each line is published as its own MQTT `gcode_line` command with a 50 ms gap between them. Checked, all lines are joined with newlines and published in a single `gcode_line` command, which is much faster to queue but sends one large MQTT payload the printer may reject if it is too big.
 
-For `Print Direct`, the web UI tracks the active direct job separately. The send action only means the G-code was queued; the job is marked `complete` the moment the MQTT listener sees the final marker, whether or not a browser is polling. While a job is active the listener also sends the printer a `pushall` request twice per second, which keeps the printer emitting a full report about once per second instead of on its own multi-second cadence. The printer never answers faster than once per second however often it is asked, and rates of 10 Hz or more measured slightly slower detection. If the marker does not arrive within the estimated run time × 1.5 (minimum 30 s), the job is marked `stalled`. The estimate sums move distance divided by the modal feed rate plus `G4` dwells, ignoring acceleration. Jobs are queryable at `/api/gcode/jobs` and `/api/gcode/jobs/<id>`.
+For `Print Direct`, the web UI tracks the active direct job separately. The send action only means the G-code was queued; the job is marked `complete` the moment the MQTT listener sees the final marker, whether or not a browser is polling. While a job is active the listener also sends the printer a `pushall` request twice per second, which keeps the printer emitting a full report about once per second instead of on its own multi-second cadence. The printer never answers faster than once per second however often it is asked, and rates of 10 Hz or more measured slightly slower detection. If the marker does not arrive within the estimated run time × 1.5 (minimum 30 s), the job is marked `stalled`. The estimate sums move distance divided by the modal feed rate plus `G4` dwells, ignoring acceleration, and starts from the position the previous direct send left the head at. Jobs are queryable at `/api/gcode/jobs` and `/api/gcode/jobs/<id>`.
+
+Several direct jobs can be in flight at once. Each new job's marker continues the counter from the newest queued job, and a report matching a later job also completes every job queued before it, so a marker the printer's once-per-second reporting skipped cannot strand a job. Deadlines chain, so a job's timeout starts where the previous job's deadline ends. The send endpoint takes two extra options:
+
+- `"m400": false` drops the motion wait before the marker. Use it for every batch that has another batch queued behind it, so the pen never stops; keep the default `true` on the final batch so its done signal is exact.
+- `"wait": true` blocks the request until the job completes, stalls, or `wait_seconds` pass (default: the job's own timeout plus a margin), and returns the final job state with `completed` set.
+
+Measured on an A1 drawing three 60 mm circles as four quarter batches each: waiting for each batch's done signal before sending the next took 63 to 73 s; queueing the quarters back to back with `m400: false` on the first three and `wait: true` on the last took 38.7 s against 33.9 s of pure motion, and every batch still reported its own marker.
 
 ### Done-signal latency benchmark
 
@@ -219,7 +226,11 @@ curl http://localhost:5425/api/gcode/benchmark      # progress and results
 curl -X POST http://localhost:5425/api/gcode/benchmark/stop
 ```
 
-The head must have clear travel between those points and Z is not touched, so lift the pen first. Add `"distance_mm": 0` to make the measured batch a zero-motion move, which isolates the printer's command and reporting latency from motion time.
+The head must have clear travel between those points and Z is not touched, so lift the pen first. Add `"distance_mm": 0` to make the measured batch a zero-motion move, which isolates the printer's command and reporting latency from motion time, and `"pushall_interval": 0.5` to try a different status request rate.
+
+`POST /api/gcode/benchmark-3mf` (body: `iterations`, `feed_rate`) times the 3MF path instead: package, upload, start command, then the printer's `gcode_state` going PREPARE and RUNNING, a marker placed just before the first move, the `M400`-gated done marker, and FINISH. Measured on an A1: the head starts moving 6 to 10 s after the start command plus about 1 s of upload, the done marker has the same 1 to 2 s lag as direct streaming, and FINISH comes 3 s later from the template's end-of-print sequence. Direct streaming starts 7 to 11 s sooner.
+
+Of the G-codes that could mark state in a streamed job, only `M73 P/R` (progress) and `M1002 gcode_claim_action : <n>` (stage code, shown as `stg_cur` and as text on the printer screen) change the report; `M73 L` and `M991` do nothing outside a file print, and no field reflects head position.
 
 While a job is active the server log prints one line per MQTT report (`MQTT report +1.850s ...`) with the time since queueing, whether it answered one of our pushalls, and the progress fields it carried. The same timeline is stored per run in the benchmark result under `reports`. Measured on an A1 in September 2026: the printer answers pushall at most once per second however often it is asked, and its status snapshot picks up an executed `M73` about 1 to 2 seconds late, so the done signal trails the end of motion by roughly 0.5 to 3 seconds (median about 1.7 s) and cannot be made faster from the client side.
 

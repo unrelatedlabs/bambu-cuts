@@ -204,9 +204,10 @@ def _record_job_report(print_status, meta):
     the report reaches us.
     """
     with direct_job_lock:
-        job = state.get('direct_job') or {}
-        if not job.get('active'):
+        active = _active_direct_jobs()
+        if not active:
             return
+        job = active[-1]
         queued_at = job.get('queued_at') or job.get('started_at') or time.time()
         entry = {
             't': round(time.time() - queued_at, 3),
@@ -334,7 +335,7 @@ def mqtt_feed_health(last_update):
 def _active_job_pushall_interval():
     """Pushall cadence for the MQTT listener: fast while a direct job is active, else none."""
     with direct_job_lock:
-        active = bool((state.get('direct_job') or {}).get('active'))
+        active = bool(_active_direct_jobs())
     active = active or bool(state.get('mqtt_watch'))
     return state.get('pushall_interval', DIRECT_JOB_STATUS_POLL_INTERVAL) if active else None
 
@@ -641,16 +642,6 @@ def extract_executable_gcode(gcode_text: str):
             yield line_num, code
 
 
-def current_mqtt_marker_pair():
-    """Return the currently cached (M73 P, M73 R) pair."""
-    with mqtt_status_lock:
-        cached_print = dict(state['mqtt_status'].get('print') or {})
-        return (
-            cached_print.get('mc_percent'),
-            cached_print.get('mc_remaining_time'),
-        )
-
-
 def _gcode_words(code: str):
     """Split an executable G-code line into (letter, value) words."""
     words = []
@@ -665,7 +656,7 @@ def _gcode_words(code: str):
 
 
 def estimate_gcode_seconds(gcode_text: str, default_feed_mm_min: float = 1000.0,
-                           start_position=None) -> float:
+                           start_position=None, return_position: bool = False):
     """Estimate how long the printer needs to execute the G-code.
 
     Sums linear move distance divided by the modal feed rate, plus G4 dwells.
@@ -735,6 +726,8 @@ def estimate_gcode_seconds(gcode_text: str, default_feed_mm_min: float = 1000.0,
         if squared:
             seconds += math.sqrt(squared) / (feed_mm_min / 60.0)
 
+    if return_position:
+        return seconds, {axis.lower(): value for axis, value in position.items()}
     return seconds
 
 
@@ -743,76 +736,91 @@ def direct_job_timeout_seconds(estimated_seconds: float) -> float:
     return max(DIRECT_JOB_MIN_TIMEOUT_SECONDS, estimated_seconds * DIRECT_JOB_TIMEOUT_FACTOR)
 
 
-# Done-marker strategy: a G-code line the printer echoes back as a field in
-# its MQTT status report. Only the progress marker is used:
-#   m73: M73 P<n> R0 -> mc_percent == n (and mc_remaining_time 0)
-MARKER_STRATEGIES = ('m73',)
-DEFAULT_MARKER_STRATEGY = 'm73'
-MARKER_CLEANUP_GCODE = {}
+# The done marker is `M73 P<n> R0`. The printer echoes it as mc_percent in
+# its MQTT status report, and mc_remaining_time 0 tells it apart from a real
+# print's progress. The M400 before it (when used) drains queued motion first.
+MARKER_FIELD = 'mc_percent'
 
 
-def completion_marker_percent(baseline_pair=None) -> int:
-    """Pick an M73 percent that differs from the printer's current mc_percent."""
-    baseline_percent = (baseline_pair or (None, None))[0]
+def next_marker_percent() -> int:
+    """Pick the M73 percent for a new job so its report is unambiguous.
+
+    Chains after the newest in-flight job when there is one, so markers of
+    queued batches arrive in order; otherwise steps past what the printer
+    currently reports.
+    """
+    with direct_job_lock:
+        pending = _active_direct_jobs()
+    if pending:
+        return (int(pending[-1]['marker_value']) + 1) % 100
+    with mqtt_status_lock:
+        current = (state['mqtt_status'].get('print') or {}).get(MARKER_FIELD)
     try:
-        return (int(baseline_percent) + 1) % 100
+        return (int(current) + 1) % 100
     except (TypeError, ValueError):
         return 1
 
 
-def build_completion_marker(strategy: str, cached_print: dict):
-    """Return (gcode_line, report_field, expected_value, marker_percent) for a strategy.
-
-    The expected value is chosen to differ from what the printer currently
-    reports, so the change is unambiguous.
-    """
-    percent = completion_marker_percent((cached_print.get('mc_percent'), cached_print.get('mc_remaining_time')))
-    return f"M73 P{percent} R0", 'mc_percent', str(percent), percent
-
-
-def add_completion_marker(gcode_text: str, baseline_pair=None, default_feed_mm_min: float = 1000.0,
-                          start_position=None, strategy: str = DEFAULT_MARKER_STRATEGY):
-    """Append one M400 + done-marker line after the last executable line.
+def add_completion_marker(gcode_text: str, default_feed_mm_min: float = 1000.0,
+                          start_position=None, wait_for_motion: bool = True):
+    """Append one done-marker line (with M400 first by default) after the last line.
 
     The M400 drains queued motion, so the printer echoing the marker over
-    MQTT means every move before it has finished. A single marker keeps the
-    motion continuous; per-batch markers would force a full stop at each one.
+    MQTT means every move before it has finished. With wait_for_motion off
+    the marker fires when the parser reaches it, a few moves ahead of the
+    pen, which keeps motion continuous when another batch is queued behind.
     """
     total_commands = sum(1 for _ in extract_executable_gcode(gcode_text))
     if total_commands == 0:
         return gcode_text, {
             'enabled': False,
             'command_count': 0,
-            'marker_strategy': strategy,
-            'marker_field': None,
+            'marker_field': MARKER_FIELD,
             'marker_value': None,
-            'marker_percent': None,
+            'wait_for_motion': wait_for_motion,
             'estimated_seconds': 0.0,
             'timeout_seconds': 0.0,
         }
 
-    with mqtt_status_lock:
-        cached_print = dict(state['mqtt_status'].get('print') or {})
-    if baseline_pair is not None:
-        cached_print['mc_percent'], cached_print['mc_remaining_time'] = baseline_pair
-    marker_line, marker_field, marker_value, marker_percent = build_completion_marker(strategy, cached_print)
+    percent = next_marker_percent()
+    marker_line = f"M73 P{percent} R0"
     estimated_seconds = estimate_gcode_seconds(gcode_text, default_feed_mm_min, start_position)
-    marker_lines = [
-        f"; bambucuts done marker: {total_commands} command(s)",
-        "M400 ; wait for queued motion to finish",
-        marker_line,
-    ]
+    marker_lines = [f"; bambucuts done marker: {total_commands} command(s)"]
+    if wait_for_motion:
+        marker_lines.append("M400 ; wait for queued motion to finish")
+    marker_lines.append(marker_line)
     return '\n'.join([gcode_text.rstrip('\n'), *marker_lines]), {
         'enabled': True,
         'command_count': total_commands,
-        'marker_strategy': strategy,
         'marker_line': marker_line,
-        'marker_field': marker_field,
-        'marker_value': marker_value,
-        'marker_percent': marker_percent,
+        'marker_field': MARKER_FIELD,
+        'marker_value': str(percent),
+        'wait_for_motion': wait_for_motion,
         'estimated_seconds': round(estimated_seconds, 1),
         'timeout_seconds': round(direct_job_timeout_seconds(estimated_seconds), 1),
     }
+
+
+def _active_direct_jobs():
+    """Active jobs in queue order. Caller holds direct_job_lock."""
+    jobs = state.setdefault('direct_jobs', {})
+    ids = state.setdefault('active_direct_job_ids', [])
+    ids[:] = [i for i in ids if i in jobs and jobs[i].get('active')]
+    return [jobs[i] for i in ids]
+
+
+def _finish_direct_job(job, status, message, completed_at=None):
+    """Move a job out of the active list. Caller holds direct_job_lock."""
+    job['active'] = False
+    job['status'] = status
+    job['completed_at'] = completed_at or time.time()
+    job['message'] = message
+    ids = state.setdefault('active_direct_job_ids', [])
+    if job['id'] in ids:
+        ids.remove(job['id'])
+    if (state.get('direct_job') or {}).get('id') == job['id']:
+        state['direct_job'] = job
+    _store_direct_job(job)
 
 
 def _store_direct_job(job):
@@ -824,7 +832,7 @@ def _store_direct_job(job):
 
 
 def begin_direct_job(progress_info):
-    """Start tracking a direct-send job by its final M73 checkpoint."""
+    """Start tracking a direct-send job by its done marker."""
     started_at = time.time()
     job = {
         'id': str(uuid.uuid4()),
@@ -835,40 +843,39 @@ def begin_direct_job(progress_info):
         'queued_at': None,
         'queued_count': 0,
         'command_count': progress_info.get('command_count', 0),
-        'marker_percent': progress_info.get('marker_percent'),
-        'marker_strategy': progress_info.get('marker_strategy', DEFAULT_MARKER_STRATEGY),
         'marker_line': progress_info.get('marker_line'),
-        'marker_field': progress_info.get('marker_field', 'mc_percent'),
+        'marker_field': progress_info.get('marker_field', MARKER_FIELD),
         'marker_value': progress_info.get('marker_value'),
+        'wait_for_motion': progress_info.get('wait_for_motion', True),
         'estimated_seconds': progress_info.get('estimated_seconds', 0.0),
         'timeout_seconds': progress_info.get('timeout_seconds', DIRECT_JOB_MIN_TIMEOUT_SECONDS),
         'last_percent': None,
         'last_remaining_time': None,
         'last_update': None,
-        'message': 'Queueing G-code and waiting for the final M73 checkpoint',
+        'message': 'Queueing G-code and waiting for the done marker',
     }
 
     print(f"Direct job {job['id']} started: {job['command_count']} command(s), "
           f"marker '{job['marker_line']}' expecting {job['marker_field']}={job['marker_value']}, "
           f"estimated {job['estimated_seconds']}s, timeout {job['timeout_seconds']}s")
 
-    with mqtt_status_lock:
-        cached_print = dict(state['mqtt_status'].get('print') or {})
-        cached_print[job['marker_field']] = None
-        if job['marker_field'] == 'mc_percent':
-            cached_print['mc_remaining_time'] = None
-            cached_print['layer_num'] = None
-        state['mqtt_status']['print'] = cached_print
-
     with direct_job_lock:
-        previous = dict(state.get('direct_job') or {})
-        if previous.get('active') and previous.get('id'):
-            previous['active'] = False
-            previous['status'] = 'superseded'
-            previous['message'] = 'Superseded by a newer direct job'
-            _store_direct_job(previous)
+        in_flight = _active_direct_jobs()
+        job['queue_position'] = len(in_flight)
+        state.setdefault('active_direct_job_ids', []).append(job['id'])
         state['direct_job'] = job
         _store_direct_job(job)
+
+    if not in_flight:
+        # Nothing else is waiting on the cached value, so drop it: the next
+        # report must be a fresh one before it can complete this job.
+        with mqtt_status_lock:
+            cached_print = dict(state['mqtt_status'].get('print') or {})
+            cached_print[job['marker_field']] = None
+            if job['marker_field'] == 'mc_percent':
+                cached_print['mc_remaining_time'] = None
+                cached_print['layer_num'] = None
+            state['mqtt_status']['print'] = cached_print
 
     return job.copy()
 
@@ -876,25 +883,27 @@ def begin_direct_job(progress_info):
 def mark_direct_job_queued(job_id, queued_count, errors):
     """Record whether direct G-code was queued successfully."""
     with direct_job_lock:
-        job = dict(state.get('direct_job') or {})
-        if job.get('id') != job_id:
-            return job
+        job = state.get('direct_jobs', {}).get(job_id)
+        if not job:
+            return dict(state.get('direct_job') or {})
 
         job['queued_at'] = time.time()
         job['queued_count'] = queued_count
         job['pushalls_at_queue'] = mqtt_pushall_stats.get('pushall_count', 0)
         if errors:
-            job['active'] = False
-            job['status'] = 'queue_error'
-            job['message'] = 'Failed while queueing direct G-code'
             job['errors'] = errors
-        else:
-            job['status'] = 'waiting'
-            job['message'] = 'Queued; waiting for printer to reach the final M73 checkpoint'
+            _finish_direct_job(job, 'queue_error', 'Failed while queueing direct G-code')
+            return dict(job)
 
-        state['direct_job'] = job
+        # A job cannot start until the ones ahead of it are done, so its
+        # deadline starts where the previous in-flight job's deadline ends.
+        ahead = [j for j in _active_direct_jobs() if j['id'] != job_id]
+        base = max([job['queued_at']] + [j.get('deadline') or 0 for j in ahead])
+        job['deadline'] = base + (job.get('timeout_seconds') or DIRECT_JOB_MIN_TIMEOUT_SECONDS)
+        job['status'] = 'waiting'
+        job['message'] = 'Queued; waiting for the printer to reach the done marker'
         _store_direct_job(job)
-        return job.copy()
+        return dict(job)
 
 
 def _apply_stall_timeout(job, mqtt_progress):
@@ -907,71 +916,77 @@ def _apply_stall_timeout(job, mqtt_progress):
     if not job.get('active') or not queued_at:
         return job
 
-    waited = time.time() - queued_at
-    timeout = job.get('timeout_seconds') or DIRECT_JOB_MIN_TIMEOUT_SECONDS
-    if waited < timeout:
+    now = time.time()
+    deadline = job.get('deadline') or (queued_at + (job.get('timeout_seconds') or DIRECT_JOB_MIN_TIMEOUT_SECONDS))
+    if now < deadline:
         return job
 
-    reason = mqtt_progress.get('stale_reason') or f'no checkpoint after {waited:.0f}s (timeout {timeout:.0f}s)'
-
-    job['active'] = False
-    job['status'] = 'stalled'
-    job['completed_at'] = time.time()
-    job['message'] = f'Stopped waiting for the final checkpoint: {reason}'
+    waited = now - queued_at
+    reason = mqtt_progress.get('stale_reason') or f'no checkpoint after {waited:.0f}s'
+    _finish_direct_job(job, 'stalled', f'Stopped waiting for the final checkpoint: {reason}')
     print(f"Direct job {job.get('id')} stalled: {job['message']}")
+    return dict(job)
 
-    state['direct_job'] = job
-    _store_direct_job(job)
-    return job.copy()
+
+def _stall_check_all(mqtt_progress):
+    """Run the stall check over every in-flight job. Caller holds direct_job_lock."""
+    for job in list(_active_direct_jobs()):
+        _apply_stall_timeout(job, mqtt_progress)
+    return dict(state.get('direct_job') or {})
 
 
 def update_direct_job_from_mqtt(mqtt_progress):
-    """Update the active direct job from cached MQTT M73 progress."""
+    """Resolve in-flight direct jobs against the latest cached MQTT report."""
     with direct_job_lock:
-        job = dict(state.get('direct_job') or {})
-
-        if not job.get('active'):
-            return job
+        active = _active_direct_jobs()
+        if not active:
+            return dict(state.get('direct_job') or {})
 
         progress_update = mqtt_progress.get('last_update')
         percent = mqtt_progress.get('percent')
         remaining_time = mqtt_progress.get('remaining_time')
-        field = job.get('marker_field') or 'mc_percent'
+        field = active[0].get('marker_field') or 'mc_percent'
         reported = (mqtt_progress.get('print') or {}).get(field)
         if mqtt_progress.get('stale'):
-            return _apply_stall_timeout(job, mqtt_progress)
-        if progress_update is None or progress_update < job.get('started_at', 0) or reported is None:
-            return _apply_stall_timeout(job, mqtt_progress)
+            return _stall_check_all(mqtt_progress)
+        if progress_update is None or reported is None:
+            return _stall_check_all(mqtt_progress)
+        if field == 'mc_percent' and remaining_time is not None and remaining_time != 0:
+            # Our markers always send R0, so a nonzero remaining time is not ours.
+            return _stall_check_all(mqtt_progress)
 
-        if field == 'mc_percent':
-            # Our marker always sends R0, so a nonzero remaining time is not ours.
-            if remaining_time is not None and remaining_time != 0:
-                return _apply_stall_timeout(job, mqtt_progress)
-        if str(reported) != str(job.get('marker_value')):
-            return _apply_stall_timeout(job, mqtt_progress)
+        # Find which in-flight job this report belongs to. Everything queued
+        # before it must already have executed, so complete those too even if
+        # their own report was skipped by the printer's 1 Hz cadence.
+        matched = next((i for i, j in enumerate(active)
+                        if str(reported) == str(j.get('marker_value'))
+                        and progress_update >= j.get('started_at', 0)), None)
+        if matched is None:
+            return _stall_check_all(mqtt_progress)
 
         meta = mqtt_progress.get('report_meta') or {}
-        detect_seconds = round(progress_update - job['queued_at'], 3) if job.get('queued_at') else None
-        job['last_percent'] = percent
-        job['last_remaining_time'] = remaining_time
-        job['last_update'] = progress_update
-        job['active'] = False
-        job['status'] = 'complete'
-        job['completed_at'] = progress_update
-        job['detect_seconds'] = detect_seconds
-        job['detect_report_kind'] = 'pushall' if meta.get('pushall_matched') else 'delta'
-        job['detect_pushall_rtt'] = round(meta['pushall_rtt'], 3) if meta.get('pushall_rtt') is not None else None
-        job['detect_since_pushall'] = round(meta['since_last_pushall'], 3) if meta.get('since_last_pushall') is not None else None
-        job['pushalls_sent'] = max(0, meta.get('pushall_count', 0) - job.get('pushalls_at_queue', 0))
-        job['message'] = 'Direct G-code execution reached the final done marker'
-        print(f"Final checkpoint reached: {field}={reported} at +{detect_seconds}s after queue, "
-              f"via {job['detect_report_kind']} (rtt {job['detect_pushall_rtt']}s, "
-              f"since last pushall {job['detect_since_pushall']}s), "
-              f"{job['pushalls_sent']} pushalls sent during job. Done.")
+        for index, job in enumerate(active[:matched + 1]):
+            inferred = index < matched
+            detect_seconds = round(progress_update - job['queued_at'], 3) if job.get('queued_at') else None
+            job['last_percent'] = percent
+            job['last_remaining_time'] = remaining_time
+            job['last_update'] = progress_update
+            job['detect_seconds'] = detect_seconds
+            job['detect_inferred'] = inferred
+            job['detect_report_kind'] = 'pushall' if meta.get('pushall_matched') else 'delta'
+            job['detect_pushall_rtt'] = round(meta['pushall_rtt'], 3) if meta.get('pushall_rtt') is not None else None
+            job['detect_since_pushall'] = round(meta['since_last_pushall'], 3) if meta.get('since_last_pushall') is not None else None
+            job['pushalls_sent'] = max(0, meta.get('pushall_count', 0) - job.get('pushalls_at_queue', 0))
+            _finish_direct_job(
+                job, 'complete',
+                'Completed (inferred from a later checkpoint)' if inferred
+                else 'Direct G-code execution reached the final done marker',
+                completed_at=progress_update)
+            print(f"Final checkpoint reached for job {job['id'][:8]}: {field}={reported} at +{detect_seconds}s "
+                  f"after queue{' (inferred)' if inferred else ''}, via {job['detect_report_kind']}, "
+                  f"{job['pushalls_sent']} pushalls sent during job. Done.")
 
-        state['direct_job'] = job
-        _store_direct_job(job)
-        return job.copy()
+        return dict(state.get('direct_job') or {})
 
 
 def current_mqtt_progress():
@@ -1033,6 +1048,14 @@ def _bounded_query_int(name: str, default: int, minimum: int, maximum: int) -> i
     return max(minimum, min(maximum, value))
 
 
+def _bounded_body_int(data, name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(data.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
 def _query_bool(name: str, default: bool = False) -> bool:
     raw = request.args.get(name)
     if raw is None:
@@ -1065,6 +1088,8 @@ def get_status():
     # The per-report timeline can be hundreds of entries; keep the 1 Hz status
     # poll light and leave the full record to /api/gcode/jobs/<id>.
     direct_job = {k: v for k, v in direct_job.items() if k != 'reports'}
+    with direct_job_lock:
+        direct_job['in_flight'] = len(_active_direct_jobs())
 
     return jsonify({
         'position': state['position'],
@@ -1583,7 +1608,7 @@ def format_gcode():
 
 
 def queue_direct_gcode(gcode_text: str, single_call: bool = False, progress_markers: bool = True,
-                       start_position=None, marker_strategy: str = DEFAULT_MARKER_STRATEGY):
+                       start_position=None, wait_for_motion: bool = True):
     """Queue G-code on the printer as a tracked direct job.
 
     Returns the same dict the send-all endpoint reports. When progress
@@ -1597,7 +1622,7 @@ def queue_direct_gcode(gcode_text: str, single_call: bool = False, progress_mark
     progress_info = {
         'enabled': False,
         'command_count': sum(1 for _ in extract_executable_gcode(gcode_text)),
-        'marker_percent': None,
+        'marker_value': None,
         'estimated_seconds': round(estimate_gcode_seconds(gcode_text, state['feed_rate'], start_position), 1),
         'timeout_seconds': 0.0,
     }
@@ -1607,7 +1632,7 @@ def queue_direct_gcode(gcode_text: str, single_call: bool = False, progress_mark
             gcode_text,
             default_feed_mm_min=state['feed_rate'],
             start_position=start_position,
-            strategy=marker_strategy,
+            wait_for_motion=wait_for_motion,
         )
 
     sent_count = 0
@@ -1653,6 +1678,14 @@ def queue_direct_gcode(gcode_text: str, single_call: bool = False, progress_mark
 
     if direct_job:
         direct_job = mark_direct_job_queued(direct_job['id'], queued_count, errors)
+    if not errors:
+        # Direct sends bypass the jog tracker; record where this G-code
+        # leaves the head so the next estimate starts from the right place.
+        _, end_position = estimate_gcode_seconds(
+            gcode_text, state['feed_rate'], start_position, return_position=True)
+        for axis, value in end_position.items():
+            if value is not None:
+                state['position'][axis] = value
 
     return {
         'success': len(errors) == 0,
@@ -1667,12 +1700,14 @@ def queue_direct_gcode(gcode_text: str, single_call: bool = False, progress_mark
     }
 
 
-def wait_for_direct_job(job_id: str, poll_seconds: float = 0.02, stop_event=None):
+def wait_for_direct_job(job_id: str, poll_seconds: float = 0.02, stop_event=None, timeout: float = None):
     """Block until the direct job leaves the active state, then return it.
 
     The MQTT callback resolves completion on its own; this loop also re-runs
-    the stall check so a dead feed still ends the wait.
+    the stall check so a dead feed still ends the wait. With a timeout the
+    job is returned as-is when it expires, possibly still active.
     """
+    deadline = (time.monotonic() + timeout) if timeout else None
     while True:
         with direct_job_lock:
             job = dict(state.get('direct_jobs', {}).get(job_id) or {})
@@ -1681,6 +1716,8 @@ def wait_for_direct_job(job_id: str, poll_seconds: float = 0.02, stop_event=None
         if not job.get('active'):
             return job
         if stop_event is not None and stop_event.is_set():
+            return job
+        if deadline is not None and time.monotonic() >= deadline:
             return job
         _, mqtt_progress = current_mqtt_progress()
         update_direct_job_from_mqtt(mqtt_progress)
@@ -1694,11 +1731,37 @@ def send_all_gcode():
     gcode_text = data.get('gcode', '')
     progress_markers = data.get('progress_markers', True)
     single_call = bool(data.get('single_call', False))
+    # m400=false drops the motion wait before the marker: use it for batches
+    # that have another batch queued behind them so the pen never stops.
+    wait_for_motion = bool(data.get('m400', True))
+    # wait=true blocks until the job completes, stalls, or wait_seconds pass
+    # (default: the job's own timeout plus a margin) and returns the final job.
+    wait = bool(data.get('wait', False))
 
     if not gcode_text.strip():
         return jsonify({'success': False, 'error': 'No G-code to send'}), 400
 
-    return jsonify(queue_direct_gcode(gcode_text, single_call=single_call, progress_markers=progress_markers))
+    result = queue_direct_gcode(gcode_text, single_call=single_call, progress_markers=progress_markers,
+                                wait_for_motion=wait_for_motion)
+    if wait and result.get('job_id'):
+        try:
+            wait_seconds = float(data.get('wait_seconds') or 0) or None
+        except (TypeError, ValueError):
+            wait_seconds = None
+        if wait_seconds is None:
+            job = result['direct_job'] or {}
+            wait_seconds = (job.get('deadline') or time.time() + DIRECT_JOB_MIN_TIMEOUT_SECONDS) - time.time() + 5.0
+        t0 = time.perf_counter()
+        job = wait_for_direct_job(result['job_id'], timeout=max(0.0, wait_seconds)) or result['direct_job']
+        result['direct_job'] = {k: v for k, v in job.items() if k != 'reports'}
+        result['completed'] = job.get('status') == 'complete'
+        result['waited_seconds'] = round(time.perf_counter() - t0, 3)
+        result['success'] = result['success'] and result['completed']
+        if job.get('active'):
+            result['error'] = f"Still running after {wait_seconds:.0f}s wait"
+        elif job.get('status') != 'complete':
+            result['error'] = job.get('message')
+    return jsonify(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1748,12 +1811,10 @@ def build_benchmark_gcode(line_count: int, feed_mm_min: float, distance_mm: floa
     return '\n'.join(lines)
 
 
-def _benchmark_one(gcode_text: str, single_call: bool, stop_event, start_position=None,
-                   marker_strategy: str = DEFAULT_MARKER_STRATEGY):
+def _benchmark_one(gcode_text: str, single_call: bool, stop_event, start_position=None):
     """Queue one batch, wait for its done signal, and time each phase."""
     t_send = time.perf_counter()
-    result = queue_direct_gcode(gcode_text, single_call=single_call, start_position=start_position,
-                                marker_strategy=marker_strategy)
+    result = queue_direct_gcode(gcode_text, single_call=single_call, start_position=start_position)
     t_queued = time.perf_counter()
     if not result['success'] or not result['job_id']:
         return {
@@ -1784,7 +1845,7 @@ def _benchmark_one(gcode_text: str, single_call: bool, stop_event, start_positio
 
 def run_direct_latency_benchmark(iterations: int = 10, line_counts=(1, 10), feed_mm_min=None,
                                  single_call: bool = True, stop_event=None, distance_mm=None,
-                                 marker_strategy: str = DEFAULT_MARKER_STRATEGY, pushall_interval=None):
+                                 pushall_interval=None):
     """Measure how long the done signal takes after queueing a direct batch.
 
     Each iteration first parks the head at BENCHMARK_SETUP_XY as its own job,
@@ -1808,7 +1869,6 @@ def run_direct_latency_benchmark(iterations: int = 10, line_counts=(1, 10), feed
         'setup_xy': BENCHMARK_SETUP_XY,
         'target_xy': BENCHMARK_TARGET_XY if distance_mm is None else (x0 + distance_mm, y0 + distance_mm),
         'distance_mm': distance_mm,
-        'marker_strategy': marker_strategy,
         'pushall_interval': pushall_interval if pushall_interval is not None else DIRECT_JOB_STATUS_POLL_INTERVAL,
         'cases': [],
         'error': None,
@@ -1831,11 +1891,11 @@ def run_direct_latency_benchmark(iterations: int = 10, line_counts=(1, 10), feed
             for run_index in range(1, iterations + 1):
                 if stop_event.is_set():
                     raise RuntimeError('benchmark stopped')
-                setup = _benchmark_one(setup_gcode, single_call, stop_event, marker_strategy=marker_strategy)
+                setup = _benchmark_one(setup_gcode, single_call, stop_event)
                 if not setup['ok']:
                     raise RuntimeError(f"setup move failed on run {run_index}: {setup.get('error')}")
                 run = _benchmark_one(batch_gcode, single_call, stop_event,
-                                     start_position={'x': x0, 'y': y0}, marker_strategy=marker_strategy)
+                                     start_position={'x': x0, 'y': y0})
                 run['run'] = run_index
                 if run['ok']:
                     run['overhead_seconds'] = round(
@@ -1875,10 +1935,6 @@ def run_direct_latency_benchmark(iterations: int = 10, line_counts=(1, 10), feed
                 state.pop('pushall_interval', None)
             else:
                 state['pushall_interval'] = previous_interval
-        cleanup = MARKER_CLEANUP_GCODE.get(marker_strategy)
-        if cleanup and state['printer_connected']:
-            send_gcode_to_printer(cleanup)
-            print(f"Benchmark cleanup sent: {cleanup}")
         report['finished_at'] = time.time()
         publish()
     return report
@@ -1925,10 +1981,6 @@ def start_direct_latency_benchmark():
             pushall_interval = max(0.02, min(10.0, float(pushall_interval)))
         except (TypeError, ValueError):
             return jsonify({'success': False, 'error': 'pushall_interval must be seconds'}), 400
-    marker_strategy = str(data.get('marker', DEFAULT_MARKER_STRATEGY))
-    if marker_strategy not in MARKER_STRATEGIES:
-        return jsonify({'success': False, 'error': f'marker must be one of {list(MARKER_STRATEGIES)}'}), 400
-
     benchmark_stop_event.clear()
     benchmark_thread = threading.Thread(
         target=run_direct_latency_benchmark,
@@ -1939,7 +1991,6 @@ def start_direct_latency_benchmark():
             'single_call': single_call,
             'stop_event': benchmark_stop_event,
             'distance_mm': distance_mm,
-            'marker_strategy': marker_strategy,
             'pushall_interval': pushall_interval,
         },
         daemon=True,
@@ -1970,14 +2021,6 @@ def stop_direct_latency_benchmark():
     """Ask a running benchmark to stop after the current wait."""
     benchmark_stop_event.set()
     return jsonify({'success': True})
-
-
-def _bounded_body_int(data, name: str, default: int, minimum: int, maximum: int) -> int:
-    try:
-        value = int(data.get(name, default))
-    except (TypeError, ValueError):
-        value = default
-    return max(minimum, min(maximum, value))
 
 
 # ---------------------------------------------------------------------------
@@ -2214,17 +2257,14 @@ def send_all_gcode_3mf():
         progress_info = {
             'enabled': False,
             'command_count': sum(1 for _ in extract_executable_gcode(gcode_text)),
-            'marker_percent': None,
+            'marker_value': None,
             'estimated_seconds': round(estimate_gcode_seconds(gcode_text, state['feed_rate']), 1),
             'timeout_seconds': 0.0,
         }
         gcode_to_package = gcode_text
         if progress_markers:
             gcode_to_package, progress_info = add_completion_marker(
-                gcode_text,
-                baseline_pair=current_mqtt_marker_pair(),
-                default_feed_mm_min=state['feed_rate'],
-            )
+                gcode_text, default_feed_mm_min=state['feed_rate'])
 
         # Save G-code to temporary file
         temp_gcode_path = os.path.join(temp_dir, 'temp_plot.gcode')
@@ -2300,10 +2340,7 @@ def create_3mf():
         gcode_to_package = gcode_text
         if progress_markers:
             gcode_to_package, _ = add_completion_marker(
-                gcode_text,
-                baseline_pair=current_mqtt_marker_pair(),
-                default_feed_mm_min=state['feed_rate'],
-            )
+                gcode_text, default_feed_mm_min=state['feed_rate'])
 
         # Save G-code to temporary file
         temp_gcode_path = os.path.join(temp_dir, 'temp_plot.gcode')

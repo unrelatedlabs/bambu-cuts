@@ -1272,8 +1272,9 @@ function updateDirectJobIndicator(job) {
     if (job.active) {
         const est = job.estimated_seconds ? ` / ~${Math.round(job.estimated_seconds)}s` : '';
         const shown = elapsed !== null ? `${Math.round(elapsed)}s` : '';
+        const inFlight = job.in_flight > 1 ? ` (${job.in_flight} in flight)` : '';
         el.className = 'job-indicator waiting';
-        el.textContent = job.status === 'queueing' ? '⏳ Queueing…' : `⏳ Printing… ${shown}${est}`;
+        el.textContent = job.status === 'queueing' ? '⏳ Queueing…' : `⏳ Printing… ${shown}${est}${inFlight}`;
         el.title = job.message || '';
         btn.disabled = true;
         return;
