@@ -79,7 +79,8 @@ function attachEventListeners() {
     });
 
     // Special function buttons
-    document.getElementById('homeXY').addEventListener('click', homeXY);
+    document.getElementById('homeXY').addEventListener('click', () => homeAxes('XY'));
+    document.getElementById('homeZ').addEventListener('click', () => homeAxes('Z'));
     document.getElementById('motorsOffE').addEventListener('click', () => motorsOff('E'));
     document.getElementById('motorsOffXYZ').addEventListener('click', () => motorsOff('XYZ'));
     document.getElementById('kissZ').addEventListener('click', kissZ);
@@ -410,11 +411,12 @@ async function motorsOff(axes) {
     }
 }
 
-async function homeXY() {
+async function homeAxes(axes) {
     try {
         const response = await fetch(`${API_BASE}/api/home`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' }
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ axes })
         });
 
         const data = await response.json();
@@ -423,7 +425,7 @@ async function homeXY() {
         if (data.success) {
             updatePositionDisplay(data.position);
             updateHistory();
-            showNotification('Homing XY axes', 'success');
+            showNotification(`Homing ${axes}`, 'success');
         } else {
             showNotification('Homing failed', 'error');
         }

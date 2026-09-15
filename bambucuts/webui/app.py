@@ -1172,14 +1172,19 @@ def move_axis():
 
 
 @app.route('/api/home', methods=['POST'])
-def home_xy():
-    """Home X and Y axes."""
+def home_axes():
+    """Home axes: body {"axes": "XY"} (default) or {"axes": "Z"} or {"axes": "XYZ"}."""
+    data = request.get_json(silent=True) or {}
+    axes = ''.join(ch for ch in str(data.get('axes', 'XY')).upper() if ch in 'XYZ')
+    if not axes:
+        return jsonify({'success': False, 'error': 'axes must be some of X, Y, Z'}), 400
+
     # For homing, temporarily switch to absolute mode
     set_absolute_mode()
     if state['printer_connected']:
         time.sleep(0.1)
 
-    gcode = "G28 X Y"
+    gcode = "G28 " + " ".join(axes)
     add_to_history(gcode)
 
     success = send_tracked(gcode)
@@ -1257,7 +1262,7 @@ def reset_e_zero():
 @app.route('/api/motors-off', methods=['POST'])
 def motors_off():
     """Disable stepper motors: body {"axes": "E"} or {"axes": "XYZ"} (default all)."""
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}
     axes = ''.join(ch for ch in str(data.get('axes', 'XYZE')).upper() if ch in 'XYZE')
     if not axes:
         return jsonify({'success': False, 'error': 'axes must be some of X, Y, Z, E'}), 400
