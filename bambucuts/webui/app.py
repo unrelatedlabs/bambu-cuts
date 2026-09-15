@@ -233,6 +233,44 @@ def _record_job_report(print_status, meta):
           f"R={entry['mc_remaining_time']} state={entry['gcode_state']}{extra}")
 
 
+# Fields whose changes the 3MF benchmark records while its watch is active.
+WATCH_FIELDS = ('gcode_state', 'mc_percent', 'mc_remaining_time', 'mc_print_line_number',
+                'mc_print_stage', 'mc_print_sub_stage', 'stg_cur', 'print_type', 'layer_num',
+                'print_error', 'gcode_file')
+mqtt_watch_lock = threading.Lock()
+
+
+def start_mqtt_watch():
+    """Begin recording timestamped changes of WATCH_FIELDS from every report."""
+    with mqtt_watch_lock:
+        state['mqtt_watch'] = {'started_at': time.time(), 'last': {}, 'events': []}
+
+
+def stop_mqtt_watch():
+    with mqtt_watch_lock:
+        watch = state.pop('mqtt_watch', None)
+    return watch
+
+
+def _record_watch_events(print_status):
+    with mqtt_watch_lock:
+        watch = state.get('mqtt_watch')
+        if not watch:
+            return
+        now = time.time()
+        last = watch['last']
+        for field in WATCH_FIELDS:
+            if field not in print_status:
+                continue
+            value = print_status[field]
+            if field in last and last[field] == value:
+                continue
+            old = last.get(field)
+            watch['events'].append({'t': now, 'field': field, 'old': old, 'new': value})
+            last[field] = value
+            print(f"MQTT watch +{now - watch['started_at']:7.3f}s {field}: {old!r} -> {value!r}")
+
+
 def _handle_mqtt_status_message(message):
     payload = message.get('json')
     if not isinstance(payload, dict):
@@ -242,6 +280,7 @@ def _handle_mqtt_status_message(message):
     if not isinstance(print_status, dict):
         return
 
+    _record_watch_events(print_status)
     meta = message.get('meta') or {}
     with mqtt_status_lock:
         state['mqtt_status']['last_report_meta'] = dict(meta)
@@ -296,6 +335,7 @@ def _active_job_pushall_interval():
     """Pushall cadence for the MQTT listener: fast while a direct job is active, else none."""
     with direct_job_lock:
         active = bool((state.get('direct_job') or {}).get('active'))
+    active = active or bool(state.get('mqtt_watch'))
     return state.get('pushall_interval', DIRECT_JOB_STATUS_POLL_INTERVAL) if active else None
 
 
@@ -1938,6 +1978,198 @@ def _bounded_body_int(data, name: str, default: int, minimum: int, maximum: int)
     except (TypeError, ValueError):
         value = default
     return max(minimum, min(maximum, value))
+
+
+# ---------------------------------------------------------------------------
+# 3MF print latency benchmark
+# ---------------------------------------------------------------------------
+
+BENCHMARK_3MF_FIRST_MARKER = 37
+BENCHMARK_3MF_DONE_MARKER = 73
+BENCHMARK_3MF_TIMEOUT = 180.0
+
+benchmark_3mf_thread = None
+
+
+def build_benchmark_3mf_gcode(feed_mm_min: float) -> str:
+    """Marker before the first move, park, diagonal, then M400 + done marker."""
+    (x0, y0), (x1, y1) = BENCHMARK_SETUP_XY, BENCHMARK_TARGET_XY
+    return '\n'.join([
+        "G90",
+        f"M73 P{BENCHMARK_3MF_FIRST_MARKER} R0 ; reached just before the first move",
+        f"G1 X{x0:.3f} Y{y0:.3f} F{feed_mm_min:.0f}",
+        f"G1 X{x1:.3f} Y{y1:.3f} F{feed_mm_min:.0f}",
+        "M400 ; wait for queued motion to finish",
+        f"M73 P{BENCHMARK_3MF_DONE_MARKER} R0 ; all plot motion done",
+    ])
+
+
+def _wait_for_watch(predicate, timeout: float, stop_event):
+    """Poll the watch's events until predicate(events) returns a truthy value or timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline and not stop_event.is_set():
+        with mqtt_watch_lock:
+            events = list((state.get('mqtt_watch') or {}).get('events', []))
+        found = predicate(events)
+        if found:
+            return found
+        time.sleep(0.02)
+    return None
+
+
+def run_3mf_latency_benchmark(iterations: int = 3, feed_mm_min=None, stop_event=None):
+    """Time a 3MF print from start command to first move and to end of motion.
+
+    Each iteration packages the benchmark G-code into the template 3MF,
+    uploads it, sends the start command, and then reads timestamps off the
+    MQTT watch: gcode_state RUNNING, the marker placed just before the
+    first move, the M400-gated done marker, and FINISH after the template's
+    end-of-print jingle. All times are seconds after the start command.
+    """
+    stop_event = stop_event or threading.Event()
+    feed_mm_min = float(feed_mm_min or state['feed_rate'])
+    iterations = max(1, int(iterations))
+    gcode_text = build_benchmark_3mf_gcode(feed_mm_min)
+    template_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'template.3mf')
+    estimated = estimate_gcode_seconds(gcode_text, feed_mm_min, {'x': BENCHMARK_TARGET_XY[0], 'y': BENCHMARK_TARGET_XY[1]})
+
+    report = {
+        'status': 'running', 'started_at': time.time(), 'finished_at': None,
+        'iterations': iterations, 'feed_mm_min': feed_mm_min, 'gcode': gcode_text,
+        'estimated_motion_seconds': round(estimated, 1), 'runs': [], 'stats': {}, 'error': None,
+    }
+
+    def publish():
+        with benchmark_lock:
+            state['benchmark_3mf'] = json.loads(json.dumps(report))
+    publish()
+
+    def first_time(events, field, value=None):
+        # Skip the initial snapshot (old is None): it is the state left over
+        # from before the start command, e.g. FINISH from the previous run.
+        for e in events:
+            if e['old'] is None:
+                continue
+            if e['field'] == field and (value is None or str(e['new']) == str(value)):
+                return e['t']
+        return None
+
+    try:
+        for run_index in range(1, iterations + 1):
+            if stop_event.is_set():
+                raise RuntimeError('benchmark stopped')
+            temp_dir = tempfile.mkdtemp()
+            gcode_path = os.path.join(temp_dir, 'bench.gcode')
+            out_name = f"bench_{run_index}.3mf"
+            out_path = os.path.join(temp_dir, out_name)
+            run = {'run': run_index}
+            try:
+                with open(gcode_path, 'w') as f:
+                    f.write(gcode_text)
+                t0 = time.perf_counter()
+                process_3mf(template_path, out_path, gcode_path, verbose=False)
+                t1 = time.perf_counter()
+                run['package_seconds'] = round(t1 - t0, 3)
+                run['file_bytes'] = os.path.getsize(out_path)
+                with open(out_path, 'rb') as f:
+                    result = printer.upload_file(f, out_name)
+                t2 = time.perf_counter()
+                run['upload_seconds'] = round(t2 - t1, 3)
+                if '226' not in result:
+                    raise RuntimeError(f'upload failed: {result}')
+
+                start_mqtt_watch()
+                printer.start_print(out_name, 1)
+                t_start = time.time()
+                run['start_command_seconds'] = round(time.perf_counter() - t2, 3)
+                print(f"3MF benchmark run {run_index}: started {out_name}, waiting for FINISH")
+
+                def finished(events):
+                    return first_time(events, 'gcode_state', 'FINISH') or first_time(events, 'gcode_state', 'FAILED')
+                finish_t = _wait_for_watch(finished, BENCHMARK_3MF_TIMEOUT, stop_event)
+                watch = stop_mqtt_watch() or {'events': []}
+                events = watch['events']
+                rel = lambda t: round(t - t_start, 3) if t else None
+                run['events'] = [{'t': rel(e['t']), 'field': e['field'], 'old': e['old'], 'new': e['new']}
+                                 for e in events if e['t'] >= t_start - 0.5]
+                run['t_running'] = rel(first_time(events, 'gcode_state', 'RUNNING'))
+                run['t_prepare'] = rel(first_time(events, 'gcode_state', 'PREPARE'))
+                run['t_first_move_marker'] = rel(first_time(events, 'mc_percent', BENCHMARK_3MF_FIRST_MARKER))
+                run['t_done_marker'] = rel(first_time(events, 'mc_percent', BENCHMARK_3MF_DONE_MARKER))
+                run['t_finish'] = rel(finish_t)
+                run['t_first_line_number'] = rel(next((e['t'] for e in events
+                                                       if e['field'] == 'mc_print_line_number' and str(e['new']) not in ('0', '')), None))
+                run['ok'] = run['t_done_marker'] is not None
+                if run['t_done_marker'] is not None and run['t_first_move_marker'] is not None:
+                    run['motion_window_seconds'] = round(run['t_done_marker'] - run['t_first_move_marker'], 3)
+                print(f"3MF benchmark run {run_index}: running {run['t_running']}s, first move {run['t_first_move_marker']}s, "
+                      f"done {run['t_done_marker']}s, finish {run['t_finish']}s")
+            finally:
+                for path in (gcode_path, out_path):
+                    if os.path.exists(path):
+                        os.remove(path)
+                if os.path.exists(temp_dir):
+                    os.rmdir(temp_dir)
+            report['runs'].append(run)
+            publish()
+            if not run['ok']:
+                raise RuntimeError(f"run {run_index} never reported the done marker")
+            # Let the printer settle back before the next start command.
+            time.sleep(3.0)
+
+        ok = [r for r in report['runs'] if r.get('ok')]
+        report['stats'] = {
+            key: _summarize([r.get(key) for r in ok])
+            for key in ('upload_seconds', 'start_command_seconds', 't_running', 't_first_move_marker',
+                        't_done_marker', 't_finish', 'motion_window_seconds')
+        }
+        report['status'] = 'complete'
+    except Exception as e:
+        stop_mqtt_watch()
+        report['status'] = 'failed'
+        report['error'] = str(e)
+        print(f"3MF benchmark failed: {e}")
+    finally:
+        report['finished_at'] = time.time()
+        publish()
+    return report
+
+
+@app.route('/api/gcode/benchmark-3mf', methods=['POST'])
+def start_3mf_latency_benchmark():
+    """Start the 3MF print latency benchmark in the background.
+
+    Body (optional): iterations (default 3), feed_rate in mm/min.
+    Poll GET /api/gcode/benchmark-3mf for progress and results.
+    """
+    global benchmark_3mf_thread
+    if not state['printer_connected']:
+        return jsonify({'success': False, 'error': 'Printer not connected'}), 400
+    if benchmark_3mf_thread and benchmark_3mf_thread.is_alive():
+        return jsonify({'success': False, 'error': 'Benchmark already running'}), 409
+    data = request.json or {}
+    iterations = _bounded_body_int(data, 'iterations', 3, 1, 20)
+    try:
+        feed_mm_min = float(data.get('feed_rate') or state['feed_rate'])
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'feed_rate must be a number'}), 400
+    benchmark_stop_event.clear()
+    benchmark_3mf_thread = threading.Thread(
+        target=run_3mf_latency_benchmark,
+        kwargs={'iterations': iterations, 'feed_mm_min': feed_mm_min, 'stop_event': benchmark_stop_event},
+        daemon=True,
+    )
+    benchmark_3mf_thread.start()
+    return jsonify({'success': True, 'iterations': iterations, 'feed_rate': feed_mm_min})
+
+
+@app.route('/api/gcode/benchmark-3mf', methods=['GET'])
+def get_3mf_latency_benchmark():
+    with benchmark_lock:
+        report = state.get('benchmark_3mf')
+    if not report:
+        return jsonify({'success': False, 'error': 'No 3MF benchmark has been run'}), 404
+    return jsonify({'success': True, 'benchmark': report})
 
 
 @app.route('/api/gcode/jobs', methods=['GET'])
