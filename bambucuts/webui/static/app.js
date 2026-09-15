@@ -80,6 +80,8 @@ function attachEventListeners() {
 
     // Special function buttons
     document.getElementById('homeXY').addEventListener('click', homeXY);
+    document.getElementById('motorsOffE').addEventListener('click', () => motorsOff('E'));
+    document.getElementById('motorsOffXYZ').addEventListener('click', () => motorsOff('XYZ'));
     document.getElementById('kissZ').addEventListener('click', kissZ);
     document.getElementById('microKissZ').addEventListener('click', microKissZ);
     document.getElementById('setXYZero').addEventListener('click', setXYZero);
@@ -385,6 +387,26 @@ async function moveAxis(axis, distance) {
     } catch (error) {
         console.error('Move error:', error);
         showNotification('Failed to move axis', 'error');
+    }
+}
+
+async function motorsOff(axes) {
+    try {
+        const response = await fetch(`${API_BASE}/api/motors-off`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ axes })
+        });
+        const data = await response.json();
+        if (data.success) {
+            updateHistory();
+            showNotification(`Motors off: ${axes}`, 'success');
+        } else {
+            showNotification(`Motors off failed: ${data.error || 'Unknown error'}`, 'error');
+        }
+    } catch (error) {
+        console.error('Motors off error:', error);
+        showNotification('Failed to turn motors off', 'error');
     }
 }
 
@@ -750,7 +772,7 @@ async function updateStatus() {
 
         // Update UI
         updatePositionDisplay(data.position);
-        updateConnectionStatus(data.printer_connected, data.printer_ip, data.connection_error, data.printer_state, data.mqtt_progress, data.direct_job);
+        updateConnectionStatus(data.printer_connected, data.printer_ip, data.connection_error, data.printer_state, data.mqtt_progress, data.direct_job, data.head);
         updateCameraControls(data.camera_streaming, data.camera_alive, data.printer_connected);
         updateDirectJobIndicator(data.direct_job);
     } catch (error) {
@@ -787,7 +809,17 @@ function updatePositionDisplay(position) {
     // Keep function for compatibility but do nothing
 }
 
-function updateConnectionStatus(connected, printerIp, error, printerState, mqttProgress, directJob) {
+function formatHead(head) {
+    if (!head) return '';
+    const p = head.in_flight > 0 ? head.estimated : head.position;
+    const f = (v) => Number(v).toFixed(1);
+    let text = ` | Head X${f(p.x)} Y${f(p.y)} Z${f(p.z)}`;
+    if (head.in_flight > 0) text += ` (moving, ${head.in_flight} queued, ~${Math.round(head.remaining_seconds)}s left)`;
+    if (head.uncertain) text += ' (unverified)';
+    return text;
+}
+
+function updateConnectionStatus(connected, printerIp, error, printerState, mqttProgress, directJob, head) {
     const statusBox = document.getElementById('connectionStatus');
     const statusText = document.getElementById('statusText');
     const connectBtn = document.getElementById('connectBtn');
@@ -824,6 +856,7 @@ function updateConnectionStatus(connected, printerIp, error, printerState, mqttP
                 statusMessage += ` - Direct waiting${est}`;
             }
         }
+        statusMessage += formatHead(head);
         statusText.textContent = statusMessage;
         connectBtn.textContent = 'Disconnect';
         connectBtn.className = 'btn btn-primary';

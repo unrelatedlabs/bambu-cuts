@@ -31,6 +31,7 @@ try:
     from bambucuts.compress_3mf import process_3mf
     from bambucuts.gcodetools import GCodeTools, CuttingParameters
     from bambucuts.dxf2svg import convert_dxf_to_svg
+    from bambucuts.head_tracker import HeadTracker, MotionState, simulate as simulate_gcode
 except ImportError as e:
     print(f"Error importing required modules: {e}")
     print("Make sure bambulabs_api is installed and bambucuts is available")
@@ -45,7 +46,6 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 
 # Global state
 state = {
-    'position': {'x': 0.0, 'y': 0.0, 'z': 0.0, 'e': 0.0},
     'step_size': 1.0,
     'feed_rate': 1000.0,
     'printer_connected': False,
@@ -71,6 +71,9 @@ DIRECT_JOB_HISTORY_LIMIT = 50
 
 # Printer instance
 printer = None
+
+# Where the head is, from the G-code we have sent. See bambucuts.head_tracker.
+head = HeadTracker(feed=state['feed_rate'], absolute=True)
 
 # The printer reports status every couple of seconds, so a feed with nothing
 # newer than this is dead even if the cached 'connected' flag says otherwise.
@@ -149,6 +152,7 @@ def disconnect_printer():
             set_absolute_mode()
             printer.disconnect()
             print("Disconnected from printer")
+        head.reset()
     except Exception as e:
         print(f"Error disconnecting from printer: {e}")
     finally:
@@ -552,6 +556,7 @@ def stop_camera_stream():
 
 def set_relative_mode():
     """Set printer to relative positioning mode for jogging."""
+    head.apply("G91")
     if not state['printer_connected'] or not printer:
         return False
 
@@ -566,6 +571,7 @@ def set_relative_mode():
 
 def set_absolute_mode():
     """Set printer to absolute positioning mode."""
+    head.apply("G90")
     if not state['printer_connected'] or not printer:
         return False
 
@@ -594,6 +600,18 @@ def send_gcode_to_printer(gcode: str) -> bool:
         print(f"Failed to send G-code to printer: {e}")
         state['connection_error'] = str(e)
         return False
+
+
+def send_tracked(gcode: str) -> bool:
+    """Record G-code in the head tracker, then send it if the printer is connected.
+
+    Used by the jog, homing, zeroing and manual-command paths. Direct jobs
+    are tracked as a unit by queue_direct_gcode instead.
+    """
+    head.apply(gcode)
+    if not state['printer_connected']:
+        return True
+    return send_gcode_to_printer(gcode)
 
 
 def send_gcode_lines_to_printer(lines: list) -> bool:
@@ -642,93 +660,13 @@ def extract_executable_gcode(gcode_text: str):
             yield line_num, code
 
 
-def _gcode_words(code: str):
-    """Split an executable G-code line into (letter, value) words."""
-    words = []
-    for part in code.split():
-        letter = part[0].upper()
-        try:
-            value = float(part[1:])
-        except ValueError:
-            continue
-        words.append((letter, value))
-    return words
+def estimate_gcode_seconds(gcode_text: str, start: MotionState = None) -> float:
+    """Seconds the printer needs for the G-code, starting from `start`.
 
-
-def estimate_gcode_seconds(gcode_text: str, default_feed_mm_min: float = 1000.0,
-                           start_position=None, return_position: bool = False):
-    """Estimate how long the printer needs to execute the G-code.
-
-    Sums linear move distance divided by the modal feed rate, plus G4 dwells.
-    Acceleration is ignored, so short segments run slower than estimated; the
-    caller pads the result. Tracks G90/G91 and G92 so distances are right for
-    both absolute and relative files. `start_position` seeds the head
-    position as {'x': .., 'y': .., 'z': ..}; axes still unknown contribute
-    nothing until the first move sets them.
+    Defaults to where the queued G-code will leave the head, so a batch sent
+    behind others is timed from the right place and in the right G90/G91 mode.
     """
-    seconds = 0.0
-    feed_mm_min = max(1.0, float(default_feed_mm_min or 1000.0))
-    absolute = True
-    position = {'X': None, 'Y': None, 'Z': None}
-    for axis, value in (start_position or {}).items():
-        axis = str(axis).upper()
-        if axis in position and value is not None:
-            try:
-                position[axis] = float(value)
-            except (TypeError, ValueError):
-                pass
-
-    for _, code in extract_executable_gcode(gcode_text):
-        upper = code.upper()
-        cmd = upper.split()[0]
-
-        if cmd == 'G90':
-            absolute = True
-            continue
-        if cmd == 'G91':
-            absolute = False
-            continue
-        if cmd == 'G92':
-            for letter, value in _gcode_words(upper)[1:]:
-                if letter in position:
-                    position[letter] = value
-            continue
-        if cmd == 'G4':
-            for letter, value in _gcode_words(upper)[1:]:
-                if letter == 'P':
-                    seconds += value / 1000.0
-                elif letter == 'S':
-                    seconds += value
-            continue
-        if cmd == 'G28':
-            for axis in position:
-                position[axis] = 0.0
-            continue
-        if cmd not in ('G0', 'G1'):
-            continue
-
-        squared = 0.0
-        for letter, value in _gcode_words(upper)[1:]:
-            if letter == 'F':
-                if value > 0:
-                    feed_mm_min = value
-                continue
-            if letter not in position:
-                continue
-            if absolute:
-                if position[letter] is not None:
-                    squared += (value - position[letter]) ** 2
-                position[letter] = value
-            else:
-                squared += value ** 2
-                if position[letter] is not None:
-                    position[letter] += value
-        if squared:
-            seconds += math.sqrt(squared) / (feed_mm_min / 60.0)
-
-    if return_position:
-        return seconds, {axis.lower(): value for axis, value in position.items()}
-    return seconds
+    return simulate_gcode(gcode_text, start or head.target_state()).seconds
 
 
 def direct_job_timeout_seconds(estimated_seconds: float) -> float:
@@ -761,8 +699,7 @@ def next_marker_percent() -> int:
         return 1
 
 
-def add_completion_marker(gcode_text: str, default_feed_mm_min: float = 1000.0,
-                          start_position=None, wait_for_motion: bool = True):
+def add_completion_marker(gcode_text: str, wait_for_motion: bool = True):
     """Append one done-marker line (with M400 first by default) after the last line.
 
     The M400 drains queued motion, so the printer echoing the marker over
@@ -784,7 +721,7 @@ def add_completion_marker(gcode_text: str, default_feed_mm_min: float = 1000.0,
 
     percent = next_marker_percent()
     marker_line = f"M73 P{percent} R0"
-    estimated_seconds = estimate_gcode_seconds(gcode_text, default_feed_mm_min, start_position)
+    estimated_seconds = estimate_gcode_seconds(gcode_text)
     marker_lines = [f"; bambucuts done marker: {total_commands} command(s)"]
     if wait_for_motion:
         marker_lines.append("M400 ; wait for queued motion to finish")
@@ -893,6 +830,7 @@ def mark_direct_job_queued(job_id, queued_count, errors):
         if errors:
             job['errors'] = errors
             _finish_direct_job(job, 'queue_error', 'Failed while queueing direct G-code')
+            head.drop(job_id)
             return dict(job)
 
         # A job cannot start until the ones ahead of it are done, so its
@@ -924,6 +862,7 @@ def _apply_stall_timeout(job, mqtt_progress):
     waited = now - queued_at
     reason = mqtt_progress.get('stale_reason') or f'no checkpoint after {waited:.0f}s'
     _finish_direct_job(job, 'stalled', f'Stopped waiting for the final checkpoint: {reason}')
+    head.drop(job['id'])
     print(f"Direct job {job.get('id')} stalled: {job['message']}")
     return dict(job)
 
@@ -982,6 +921,7 @@ def update_direct_job_from_mqtt(mqtt_progress):
                 'Completed (inferred from a later checkpoint)' if inferred
                 else 'Direct G-code execution reached the final done marker',
                 completed_at=progress_update)
+            head.commit(job['id'], at=progress_update)
             print(f"Final checkpoint reached for job {job['id'][:8]}: {field}={reported} at +{detect_seconds}s "
                   f"after queue{' (inferred)' if inferred else ''}, via {job['detect_report_kind']}, "
                   f"{job['pushalls_sent']} pushalls sent during job. Done.")
@@ -1092,7 +1032,8 @@ def get_status():
         direct_job['in_flight'] = len(_active_direct_jobs())
 
     return jsonify({
-        'position': state['position'],
+        'position': head.position,
+        'head': head.snapshot(),
         'step_size': state['step_size'],
         'printer_connected': state['printer_connected'],
         'connection_error': state['connection_error'],
@@ -1216,25 +1157,16 @@ def move_axis():
     if axis not in ['x', 'y', 'z', 'e']:
         return jsonify({'success': False, 'error': 'Invalid axis'}), 400
 
-    # Update position
-    state['position'][axis] += distance
-
-    # Generate G-code
     gcode_relative = "G91"
     gcode_move = f"G1 {axis.upper()}{distance:.3f} F{state['feed_rate']:.0f}"
-
-    # Add to history
     add_to_history(gcode_relative)
     add_to_history(gcode_move)
 
-    # Send to printer if connected
-    success = True
-    if state['printer_connected']:
-        success = send_gcode_to_printer(gcode_relative) and send_gcode_to_printer(gcode_move)
+    success = send_tracked(gcode_relative) and send_tracked(gcode_move)
 
     return jsonify({
         'success': success,
-        'position': state['position'],
+        'position': head.position,
         'gcode': [gcode_relative, gcode_move]
     })
 
@@ -1242,27 +1174,22 @@ def move_axis():
 @app.route('/api/home', methods=['POST'])
 def home_xy():
     """Home X and Y axes."""
-    # Reset position
-    state['position']['x'] = 0.0
-    state['position']['y'] = 0.0
-
     # For homing, temporarily switch to absolute mode
+    set_absolute_mode()
     if state['printer_connected']:
-        set_absolute_mode()
         time.sleep(0.1)
 
     gcode = "G28 X Y"
     add_to_history(gcode)
 
-    success = True
+    success = send_tracked(gcode)
     if state['printer_connected']:
-        success = send_gcode_to_printer(gcode)
         time.sleep(0.1)
-        set_relative_mode()
+    set_relative_mode()
 
     return jsonify({
         'success': success,
-        'position': state['position'],
+        'position': head.position,
         'gcode': gcode
     })
 
@@ -1270,19 +1197,14 @@ def home_xy():
 @app.route('/api/set-xy-zero', methods=['POST'])
 def set_xy_zero():
     """Set current X and Y position as zero."""
-    state['position']['x'] = 0.0
-    state['position']['y'] = 0.0
-
     gcode = "G92 X0 Y0"
     add_to_history(gcode)
 
-    success = True
-    if state['printer_connected']:
-        success = send_gcode_to_printer(gcode)
+    success = send_tracked(gcode)
 
     return jsonify({
         'success': success,
-        'position': state['position'],
+        'position': head.position,
         'gcode': gcode
     })
 
@@ -1290,21 +1212,14 @@ def set_xy_zero():
 @app.route('/api/set-xyze-zero', methods=['POST'])
 def set_xyze_zero():
     """Set current X, Y, Z and E positions as zero."""
-    state['position']['x'] = 0.0
-    state['position']['y'] = 0.0
-    state['position']['z'] = 0.0
-    state['position']['e'] = 0.0
-
     gcode = "G92 X0 Y0 Z0 E0"
     add_to_history(gcode)
 
-    success = True
-    if state['printer_connected']:
-        success = send_gcode_to_printer(gcode)
+    success = send_tracked(gcode)
 
     return jsonify({
         'success': success,
-        'position': state['position'],
+        'position': head.position,
         'gcode': gcode
     })
 
@@ -1312,18 +1227,14 @@ def set_xyze_zero():
 @app.route('/api/save-z-zero', methods=['POST'])
 def save_z_zero():
     """Save current Z position as zero."""
-    state['position']['z'] = 0.0
-
     gcode = "G92 Z0"
     add_to_history(gcode)
 
-    success = True
-    if state['printer_connected']:
-        success = send_gcode_to_printer(gcode)
+    success = send_tracked(gcode)
 
     return jsonify({
         'success': success,
-        'position': state['position'],
+        'position': head.position,
         'gcode': gcode
     })
 
@@ -1331,18 +1242,34 @@ def save_z_zero():
 @app.route('/api/reset-e-zero', methods=['POST'])
 def reset_e_zero():
     """Reset E position to zero."""
-    state['position']['e'] = 0.0
-
     gcode = "G92 E0"
     add_to_history(gcode)
 
-    success = True
-    if state['printer_connected']:
-        success = send_gcode_to_printer(gcode)
+    success = send_tracked(gcode)
 
     return jsonify({
         'success': success,
-        'position': state['position'],
+        'position': head.position,
+        'gcode': gcode
+    })
+
+
+@app.route('/api/motors-off', methods=['POST'])
+def motors_off():
+    """Disable stepper motors: body {"axes": "E"} or {"axes": "XYZ"} (default all)."""
+    data = request.json or {}
+    axes = ''.join(ch for ch in str(data.get('axes', 'XYZE')).upper() if ch in 'XYZE')
+    if not axes:
+        return jsonify({'success': False, 'error': 'axes must be some of X, Y, Z, E'}), 400
+
+    gcode = "M18 " + " ".join(axes)
+    add_to_history(gcode)
+    success = send_tracked(gcode)
+
+    return jsonify({
+        'success': success,
+        'position': head.position,
+        'head': head.snapshot(),
         'gcode': gcode
     })
 
@@ -1353,25 +1280,22 @@ def move_z_absolute():
     data = request.json
     z_position = float(data.get('position', 0))
 
-    state['position']['z'] = z_position
-
     # Switch to absolute mode
+    set_absolute_mode()
     if state['printer_connected']:
-        set_absolute_mode()
         time.sleep(0.1)
 
     gcode = f"G1 Z{z_position:.1f} F600"
     add_to_history(gcode)
 
-    success = True
+    success = send_tracked(gcode)
     if state['printer_connected']:
-        success = send_gcode_to_printer(gcode)
         time.sleep(0.1)
-        set_relative_mode()
+    set_relative_mode()
 
     return jsonify({
         'success': success,
-        'position': state['position'],
+        'position': head.position,
         'gcode': gcode
     })
 
@@ -1399,60 +1323,11 @@ def execute_gcode():
         return jsonify({'success': False, 'error': 'Empty G-code'}), 400
 
     add_to_history(gcode)
-
-    success = True
-    if state['printer_connected']:
-        success = send_gcode_to_printer(gcode)
-
-    # Track position from EVERY line, G90/G91-aware (multi-line safe).
-    # The absolute/relative mode persists across calls in state, matching
-    # the printer's own modal state.
-    for raw in gcode.split('\n'):
-        cmd = raw.split(';')[0].strip().upper()
-        if not cmd:
-            continue
-        if cmd == 'G90':
-            state['gcode_absolute'] = True
-            continue
-        if cmd == 'G91':
-            state['gcode_absolute'] = False
-            continue
-        if cmd.startswith('G28'):
-            # homing defines the printer origin for the homed axes
-            axes = cmd.split()[1:]
-            if not axes or any(a.startswith('X') or a.startswith('Y') for a in axes):
-                state['position']['x'] = 0.0
-                state['position']['y'] = 0.0
-            if not axes or any(a.startswith('Z') for a in axes):
-                state['position']['z'] = 0.0
-            continue
-        if cmd.startswith('G92'):
-            for part in cmd.split()[1:]:
-                ax = part[0].lower()
-                if ax in 'xyze':
-                    try:
-                        state['position'][ax] = float(part[1:] or 0.0)
-                    except ValueError:
-                        pass
-            continue
-        if cmd.startswith(('G0 ', 'G1 ')) or cmd in ('G0', 'G1'):
-            absolute = state.get('gcode_absolute', True)
-            for part in cmd.split()[1:]:
-                ax = part[0].lower()
-                if ax not in 'xyz':   # E is relative (M83) on this rig
-                    continue
-                try:
-                    val = float(part[1:])
-                except ValueError:
-                    continue
-                if absolute:
-                    state['position'][ax] = val
-                else:
-                    state['position'][ax] += val
+    success = send_tracked(gcode)
 
     return jsonify({
         'success': success,
-        'position': state['position'],
+        'position': head.position,
         'gcode': gcode
     })
 
@@ -1608,32 +1483,25 @@ def format_gcode():
 
 
 def queue_direct_gcode(gcode_text: str, single_call: bool = False, progress_markers: bool = True,
-                       start_position=None, wait_for_motion: bool = True):
+                       wait_for_motion: bool = True):
     """Queue G-code on the printer as a tracked direct job.
 
     Returns the same dict the send-all endpoint reports. When progress
     markers are on and the printer is connected, the returned 'direct_job'
-    can be followed to completion with wait_for_direct_job(). The run-time
-    estimate starts from `start_position`, defaulting to the jog-tracked
-    position so the first move's travel is counted.
+    can be followed to completion with wait_for_direct_job(). The head
+    tracker simulates the batch from wherever the queued G-code leaves the
+    head, and commits it when the done marker arrives.
     """
-    if start_position is None:
-        start_position = dict(state['position'])
     progress_info = {
         'enabled': False,
         'command_count': sum(1 for _ in extract_executable_gcode(gcode_text)),
         'marker_value': None,
-        'estimated_seconds': round(estimate_gcode_seconds(gcode_text, state['feed_rate'], start_position), 1),
+        'estimated_seconds': round(estimate_gcode_seconds(gcode_text), 1),
         'timeout_seconds': 0.0,
     }
     gcode_to_send = gcode_text
     if progress_markers:
-        gcode_to_send, progress_info = add_completion_marker(
-            gcode_text,
-            default_feed_mm_min=state['feed_rate'],
-            start_position=start_position,
-            wait_for_motion=wait_for_motion,
-        )
+        gcode_to_send, progress_info = add_completion_marker(gcode_text, wait_for_motion=wait_for_motion)
 
     sent_count = 0
     queued_count = 0
@@ -1679,13 +1547,13 @@ def queue_direct_gcode(gcode_text: str, single_call: bool = False, progress_mark
     if direct_job:
         direct_job = mark_direct_job_queued(direct_job['id'], queued_count, errors)
     if not errors:
-        # Direct sends bypass the jog tracker; record where this G-code
-        # leaves the head so the next estimate starts from the right place.
-        _, end_position = estimate_gcode_seconds(
-            gcode_text, state['feed_rate'], start_position, return_position=True)
-        for axis, value in end_position.items():
-            if value is not None:
-                state['position'][axis] = value
+        if direct_job and direct_job.get('active'):
+            # Tracked job: the head tracker commits it when its marker arrives.
+            head.apply(gcode_to_send, job_id=direct_job['id'], queued_at=direct_job.get('queued_at'))
+        else:
+            # No done signal to wait for (markers off or printer offline):
+            # assume it executes right away.
+            head.apply(gcode_to_send)
 
     return {
         'success': len(errors) == 0,
@@ -1811,10 +1679,10 @@ def build_benchmark_gcode(line_count: int, feed_mm_min: float, distance_mm: floa
     return '\n'.join(lines)
 
 
-def _benchmark_one(gcode_text: str, single_call: bool, stop_event, start_position=None):
+def _benchmark_one(gcode_text: str, single_call: bool, stop_event):
     """Queue one batch, wait for its done signal, and time each phase."""
     t_send = time.perf_counter()
-    result = queue_direct_gcode(gcode_text, single_call=single_call, start_position=start_position)
+    result = queue_direct_gcode(gcode_text, single_call=single_call)
     t_queued = time.perf_counter()
     if not result['success'] or not result['job_id']:
         return {
@@ -1894,8 +1762,7 @@ def run_direct_latency_benchmark(iterations: int = 10, line_counts=(1, 10), feed
                 setup = _benchmark_one(setup_gcode, single_call, stop_event)
                 if not setup['ok']:
                     raise RuntimeError(f"setup move failed on run {run_index}: {setup.get('error')}")
-                run = _benchmark_one(batch_gcode, single_call, stop_event,
-                                     start_position={'x': x0, 'y': y0})
+                run = _benchmark_one(batch_gcode, single_call, stop_event)
                 run['run'] = run_index
                 if run['ok']:
                     run['overhead_seconds'] = round(
@@ -2074,7 +1941,8 @@ def run_3mf_latency_benchmark(iterations: int = 3, feed_mm_min=None, stop_event=
     iterations = max(1, int(iterations))
     gcode_text = build_benchmark_3mf_gcode(feed_mm_min)
     template_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'template.3mf')
-    estimated = estimate_gcode_seconds(gcode_text, feed_mm_min, {'x': BENCHMARK_TARGET_XY[0], 'y': BENCHMARK_TARGET_XY[1]})
+    estimated = estimate_gcode_seconds(
+        gcode_text, MotionState(x=BENCHMARK_TARGET_XY[0], y=BENCHMARK_TARGET_XY[1], feed=feed_mm_min))
 
     report = {
         'status': 'running', 'started_at': time.time(), 'finished_at': None,
@@ -2258,13 +2126,12 @@ def send_all_gcode_3mf():
             'enabled': False,
             'command_count': sum(1 for _ in extract_executable_gcode(gcode_text)),
             'marker_value': None,
-            'estimated_seconds': round(estimate_gcode_seconds(gcode_text, state['feed_rate']), 1),
+            'estimated_seconds': round(estimate_gcode_seconds(gcode_text), 1),
             'timeout_seconds': 0.0,
         }
         gcode_to_package = gcode_text
         if progress_markers:
-            gcode_to_package, progress_info = add_completion_marker(
-                gcode_text, default_feed_mm_min=state['feed_rate'])
+            gcode_to_package, progress_info = add_completion_marker(gcode_text)
 
         # Save G-code to temporary file
         temp_gcode_path = os.path.join(temp_dir, 'temp_plot.gcode')
@@ -2295,6 +2162,8 @@ def send_all_gcode_3mf():
 
         # Start the print
         printer.start_print(output_3mf_name, 1)
+        # No done signal is followed for file prints; assume the file runs.
+        head.apply(gcode_to_package)
 
         return jsonify({
             'success': True,
@@ -2339,8 +2208,7 @@ def create_3mf():
     try:
         gcode_to_package = gcode_text
         if progress_markers:
-            gcode_to_package, _ = add_completion_marker(
-                gcode_text, default_feed_mm_min=state['feed_rate'])
+            gcode_to_package, _ = add_completion_marker(gcode_text)
 
         # Save G-code to temporary file
         temp_gcode_path = os.path.join(temp_dir, 'temp_plot.gcode')

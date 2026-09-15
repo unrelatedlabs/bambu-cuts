@@ -235,6 +235,18 @@ Of the G-codes that could mark state in a streamed job, only `M73 P/R` (progress
 While a job is active the server log prints one line per MQTT report (`MQTT report +1.850s ...`) with the time since queueing, whether it answered one of our pushalls, and the progress fields it carried. The same timeline is stored per run in the benchmark result under `reports`. Measured on an A1 in September 2026: the printer answers pushall at most once per second however often it is asked, and its status snapshot picks up an executed `M73` about 1 to 2 seconds late, so the done signal trails the end of motion by roughly 0.5 to 3 seconds (median about 1.7 s) and cannot be made faster from the client side.
 
 
+## Head position tracking
+
+The printer never reports head position over MQTT, so the API tracks it from the G-code it sends. Every path (jogs, homing, zeroing, manual commands, direct jobs and 3MF sends) goes through one tracker in `bambucuts/head_tracker.py`, which simulates the G-code with the printer's modal state (G90/G91, feed rate) carried across sends. `/api/status` returns it under `head`:
+
+- `position`: where the head is known to be, after the last G-code whose execution was confirmed. Immediate commands count as executed as soon as nothing is queued ahead of them; direct jobs count when their done marker arrives.
+- `target`: where the head will be once everything queued has executed.
+- `estimated`: a live guess interpolated along the in-flight path by elapsed time, for a progress display.
+- `in_flight`, `remaining_seconds`, `absolute`, `feed`.
+- `uncertain`: true until a `G28` or `G92` establishes the position, and again after a job stalls or after `M18`/`M84` frees the X, Y or Z steppers.
+
+The status bar shows the estimate while something is moving and the known position otherwise. `POST /api/motors-off` with `{"axes": "E"}` or `{"axes": "XYZ"}` sends `M18` for those axes; the Homing section has E Off and XYZ Off buttons for it.
+
 ## My process 
 
 - Create SVG in Inkscape
