@@ -306,12 +306,26 @@ def listen_mqtt_reports(
     request_pushall: bool = True,
     port: int = BAMBU_MQTT_PORT,
     connect_timeout: float = 10.0,
+    pushall_interval: Optional[Callable[[], Optional[float]]] = None,
+    stats: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Listen to MQTT reports until stop_event is set.
 
     stop_event belongs to the caller and is only ever read here: a failed or
     dropped connection ends this session by raising MqttDumpError, so a caller
     looping on stop_event can reconnect instead of being shut down for good.
+
+    pushall_interval, when given, is polled continuously; while it returns a
+    positive number of seconds, a pushall request is published at that
+    interval so the printer reports its full state on demand instead of on
+    its own cadence. Returning None or 0 pauses the requests.
+
+    stats, when given, is updated in place with 'pushall_count' and
+    'last_pushall_at' (monotonic). Each message handed to on_message carries a
+    'meta' dict: receive time, whether its sequence_id matched a pushall we
+    sent and that pushall's round trip, time since the last pushall, and the
+    running pushall count. This is what lets a caller tell a solicited full
+    report from the printer's own unsolicited delta.
     """
     ip = (ip or "").strip()
     access_code = (access_code or "").strip()
@@ -340,6 +354,22 @@ def listen_mqtt_reports(
     client.tls_set(cert_reqs=ssl.CERT_NONE)
     client.tls_insecure_set(True)
 
+    stats = stats if stats is not None else {}
+    stats.setdefault('pushall_count', 0)
+    stats.setdefault('last_pushall_at', None)
+    pending_pushalls: Dict[str, float] = {}
+    pushall_lock = threading.Lock()
+
+    def send_pushall(seq: str) -> None:
+        now = time.monotonic()
+        with pushall_lock:
+            pending_pushalls[seq] = now
+            while len(pending_pushalls) > 64:
+                pending_pushalls.pop(next(iter(pending_pushalls)))
+            stats['pushall_count'] = stats.get('pushall_count', 0) + 1
+            stats['last_pushall_at'] = now
+        client.publish(request_topic, _pushall_payload(seq))
+
     def on_connect(client, userdata, flags, rc):
         if rc != 0:
             errors.append(f"MQTT connect failed with rc={rc}")
@@ -349,10 +379,26 @@ def listen_mqtt_reports(
         connected.set()
         client.subscribe(report_topic)
         if request_pushall:
-            client.publish(request_topic, _pushall_payload(sequence_id))
+            send_pushall(sequence_id)
 
     def handle_paho_message(client, userdata, message):
         text, parsed = _decode_payload(message.payload)
+        now = time.monotonic()
+        seq = None
+        if isinstance(parsed, dict) and isinstance(parsed.get('print'), dict):
+            seq = parsed['print'].get('sequence_id')
+        with pushall_lock:
+            sent_at = pending_pushalls.pop(str(seq), None) if seq is not None else None
+            last_pushall = stats.get('last_pushall_at')
+            count = stats.get('pushall_count', 0)
+        meta = {
+            'received_mono': now,
+            'sequence_id': seq,
+            'pushall_matched': sent_at is not None,
+            'pushall_rtt': (now - sent_at) if sent_at is not None else None,
+            'since_last_pushall': (now - last_pushall) if last_pushall is not None else None,
+            'pushall_count': count,
+        }
         mqtt_message = MqttMessage(
             timestamp=time.time(),
             topic=message.topic,
@@ -361,7 +407,9 @@ def listen_mqtt_reports(
             payload=text,
             json_payload=parsed,
         )
-        on_message(mqtt_message.to_dict())
+        record = mqtt_message.to_dict()
+        record['meta'] = meta
+        on_message(record)
 
     def on_disconnect(client, userdata, rc):
         if rc != 0 and not stop_event.is_set():
@@ -384,9 +432,16 @@ def listen_mqtt_reports(
                 raise MqttDumpError(errors[-1])
             raise MqttDumpError(f"Timed out connecting to MQTT at {ip}:{port}")
 
-        while not stop_event.wait(0.25):
+        next_pushall = 0.0
+        while not stop_event.wait(0.05):
             if session_over.is_set():
                 raise MqttDumpError(errors[-1] if errors else "MQTT connection lost")
+            interval = pushall_interval() if pushall_interval else None
+            if interval and interval > 0:
+                now = time.monotonic()
+                if now >= next_pushall:
+                    send_pushall(str(int(time.time() * 1000)))
+                    next_pushall = now + interval
     except OSError as exc:
         raise MqttDumpError(f"MQTT connection error: {exc}") from exc
     finally:

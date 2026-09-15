@@ -21,6 +21,7 @@ from pathlib import Path
 import threading
 import base64
 import math
+import statistics
 import uuid
 from io import BytesIO
 
@@ -71,12 +72,6 @@ DIRECT_JOB_HISTORY_LIMIT = 50
 # Printer instance
 printer = None
 
-# Direct-send progress markers. Each marker is queued after an M400, so MQTT
-# progress reflects completed motion up to that batch. Marker percents form a
-# wrapping counter (+1 per batch, mod 100) starting from the printer's current
-# mc_percent, so every checkpoint produces a fresh MQTT delta.
-PROGRESS_BATCH_SIZE = 25
-
 # The printer reports status every couple of seconds, so a feed with nothing
 # newer than this is dead even if the cached 'connected' flag says otherwise.
 MQTT_STALE_SECONDS = 30.0
@@ -84,10 +79,18 @@ MQTT_STALE_SECONDS = 30.0
 # How long to wait before rebuilding a dropped MQTT status connection.
 MQTT_RECONNECT_DELAY = 5.0
 
-# Give up on a queued direct job that has not reached its next M73 checkpoint
-# within this many seconds. Generous: one batch of slow F240 moves can run for
-# minutes before the checkpoint lands.
-DIRECT_JOB_STALL_SECONDS = 300.0
+# A direct job is considered stalled once it has waited longer than its
+# estimated run time (from feed rates) times this factor, but never less than
+# the floor, so tiny jobs get time for the MQTT checkpoint to arrive.
+DIRECT_JOB_TIMEOUT_FACTOR = 1.5
+DIRECT_JOB_MIN_TIMEOUT_SECONDS = 30.0
+
+# While a direct job is active, ask the printer for a full status report this
+# often so the done marker is seen promptly instead of waiting for the
+# printer's own report cadence, which is several seconds. The printer answers
+# at most once per second whatever the request rate; a sweep from 1 to 20 Hz
+# on an A1 showed 2 Hz as good as anything and 10 Hz or more slightly worse.
+DIRECT_JOB_STATUS_POLL_INTERVAL = 0.5
 
 # Camera streaming control
 camera_thread = None
@@ -98,6 +101,8 @@ latest_camera_frame_time = None
 
 # MQTT status monitor control
 mqtt_status_thread = None
+# Updated in place by the listener: 'pushall_count', 'last_pushall_at'.
+mqtt_pushall_stats = {}
 mqtt_status_stop_event = threading.Event()
 mqtt_status_lock = threading.Lock()
 direct_job_lock = threading.Lock()
@@ -170,12 +175,62 @@ def _merge_mqtt_print_status(print_status):
             'connected': True,
             'error': None,
             'last_update': time.time(),
-            'print': cached_print
+            'print': cached_print,
+            'last_report_meta': state['mqtt_status'].get('last_report_meta'),
         }
 
     if changes:
         summary = ', '.join(f"{key}: {old} -> {new}" for key, (old, new) in changes.items())
         print(f"Printer progress changed: {summary}")
+
+    # Resolve the active direct job here, not only when a client polls
+    # /api/status, so completion is recorded even with no browser open.
+    _, mqtt_progress = current_mqtt_progress()
+    update_direct_job_from_mqtt(mqtt_progress)
+
+
+# Keep this many reports per job for the benchmark / job endpoints.
+DIRECT_JOB_REPORT_LOG_LIMIT = 400
+
+
+def _record_job_report(print_status, meta):
+    """Append one MQTT report to the active job's timeline and log it.
+
+    Only runs while a direct job is active, so idle traffic stays quiet. The
+    line shows when the report arrived relative to queueing, whether it was
+    the answer to one of our pushalls (and its round trip) or an unsolicited
+    delta from the printer, and what progress it carried. That is the data
+    that tells whether latency sits in the printer executing M73 or in how
+    the report reaches us.
+    """
+    with direct_job_lock:
+        job = state.get('direct_job') or {}
+        if not job.get('active'):
+            return
+        queued_at = job.get('queued_at') or job.get('started_at') or time.time()
+        entry = {
+            't': round(time.time() - queued_at, 3),
+            'kind': 'pushall' if meta.get('pushall_matched') else 'delta',
+            'rtt': round(meta['pushall_rtt'], 3) if meta.get('pushall_rtt') is not None else None,
+            'since_pushall': round(meta['since_last_pushall'], 3) if meta.get('since_last_pushall') is not None else None,
+            'keys': len(print_status),
+            'mc_percent': print_status.get('mc_percent'),
+            'mc_remaining_time': print_status.get('mc_remaining_time'),
+            'gcode_state': print_status.get('gcode_state'),
+            'marker_field': job.get('marker_field'),
+            'marker_seen': print_status.get(job.get('marker_field') or 'mc_percent'),
+        }
+        if len(print_status) < 10:
+            entry['payload'] = {k: v for k, v in print_status.items() if k != 'sequence_id'}
+        reports = job.setdefault('reports', [])
+        reports.append(entry)
+        if len(reports) > DIRECT_JOB_REPORT_LOG_LIMIT:
+            del reports[:len(reports) - DIRECT_JOB_REPORT_LOG_LIMIT]
+    rtt = f"rtt {entry['rtt']:.3f}s" if entry['rtt'] is not None else f"since pushall {entry['since_pushall']}s"
+    extra = f"  {entry['payload']}" if entry.get('payload') else ''
+    print(f"MQTT report +{entry['t']:7.3f}s {entry['kind']:7s} {rtt}  keys={entry['keys']:3d}  "
+          f"{entry['marker_field']}={entry['marker_seen']} mc_percent={entry['mc_percent']} "
+          f"R={entry['mc_remaining_time']} state={entry['gcode_state']}{extra}")
 
 
 def _handle_mqtt_status_message(message):
@@ -184,6 +239,13 @@ def _handle_mqtt_status_message(message):
         return
 
     print_status = payload.get('print')
+    if not isinstance(print_status, dict):
+        return
+
+    meta = message.get('meta') or {}
+    with mqtt_status_lock:
+        state['mqtt_status']['last_report_meta'] = dict(meta)
+    _record_job_report(print_status, meta)
     _merge_mqtt_print_status(print_status)
 
 
@@ -230,6 +292,13 @@ def mqtt_feed_health(last_update):
     }
 
 
+def _active_job_pushall_interval():
+    """Pushall cadence for the MQTT listener: fast while a direct job is active, else none."""
+    with direct_job_lock:
+        active = bool((state.get('direct_job') or {}).get('active'))
+    return state.get('pushall_interval', DIRECT_JOB_STATUS_POLL_INTERVAL) if active else None
+
+
 def start_mqtt_status_monitor():
     """Start a background MQTT listener that caches the latest print status."""
     global mqtt_status_thread, mqtt_status_stop_event
@@ -260,6 +329,8 @@ def start_mqtt_status_monitor():
                     _handle_mqtt_status_message,
                     stop_event=mqtt_status_stop_event,
                     request_pushall=True,
+                    pushall_interval=_active_job_pushall_interval,
+                    stats=mqtt_pushall_stats,
                 )
                 # Returned without error: either we were asked to stop, or the
                 # session ended quietly. Either way, reconnect below.
@@ -484,6 +555,27 @@ def send_gcode_to_printer(gcode: str) -> bool:
         return False
 
 
+def send_gcode_lines_to_printer(lines: list) -> bool:
+    """Send several G-code lines to the printer in a single MQTT gcode_line command."""
+    if not state['printer_connected'] or not printer:
+        print(f"Cannot send G-code - printer not connected: {len(lines)} lines")
+        return False
+
+    if not lines:
+        return True
+
+    try:
+        # The library joins the list with newlines into one gcode_line payload.
+        # gcode_check=False for the same reason as the single-line send.
+        printer.gcode(list(lines), gcode_check=False)
+        print(f"G-code batch sent to printer: {len(lines)} lines")
+        return True
+    except Exception as e:
+        print(f"Failed to send G-code batch to printer: {e}")
+        state['connection_error'] = str(e)
+        return False
+
+
 def add_to_history(gcode: str):
     """Add G-code command to history."""
     state['gcode_history'].append(gcode)
@@ -509,14 +601,6 @@ def extract_executable_gcode(gcode_text: str):
             yield line_num, code
 
 
-def clamp_progress_batch_size(value) -> int:
-    try:
-        batch_size = int(value)
-    except (TypeError, ValueError):
-        batch_size = PROGRESS_BATCH_SIZE
-    return max(1, min(500, batch_size))
-
-
 def current_mqtt_marker_pair():
     """Return the currently cached (M73 P, M73 R) pair."""
     with mqtt_status_lock:
@@ -527,96 +611,167 @@ def current_mqtt_marker_pair():
         )
 
 
-def build_progress_marker_plan(total_commands: int, requested_batch_size: int, baseline_pair=None):
-    """Build M73 checkpoints as a wrapping counter: +1 percent per batch.
+def _gcode_words(code: str):
+    """Split an executable G-code line into (letter, value) words."""
+    words = []
+    for part in code.split():
+        letter = part[0].upper()
+        try:
+            value = float(part[1:])
+        except ValueError:
+            continue
+        words.append((letter, value))
+    return words
 
-    Checkpoint i reports P((start + i) % 100) where start is the printer's
-    current mc_percent. Consecutive checkpoints always differ, so each one
-    produces a fresh MQTT delta, and progress tracking simply counts up,
-    wrapping past 99 back to 0 for jobs with more than 99 batches.
+
+def estimate_gcode_seconds(gcode_text: str, default_feed_mm_min: float = 1000.0,
+                           start_position=None) -> float:
+    """Estimate how long the printer needs to execute the G-code.
+
+    Sums linear move distance divided by the modal feed rate, plus G4 dwells.
+    Acceleration is ignored, so short segments run slower than estimated; the
+    caller pads the result. Tracks G90/G91 and G92 so distances are right for
+    both absolute and relative files. `start_position` seeds the head
+    position as {'x': .., 'y': .., 'z': ..}; axes still unknown contribute
+    nothing until the first move sets them.
     """
-    if total_commands <= 0:
-        return [], requested_batch_size, 0
+    seconds = 0.0
+    feed_mm_min = max(1.0, float(default_feed_mm_min or 1000.0))
+    absolute = True
+    position = {'X': None, 'Y': None, 'Z': None}
+    for axis, value in (start_position or {}).items():
+        axis = str(axis).upper()
+        if axis in position and value is not None:
+            try:
+                position[axis] = float(value)
+            except (TypeError, ValueError):
+                pass
 
-    batch_size = max(1, requested_batch_size)
-    marker_count = math.ceil(total_commands / batch_size)
+    for _, code in extract_executable_gcode(gcode_text):
+        upper = code.upper()
+        cmd = upper.split()[0]
 
+        if cmd == 'G90':
+            absolute = True
+            continue
+        if cmd == 'G91':
+            absolute = False
+            continue
+        if cmd == 'G92':
+            for letter, value in _gcode_words(upper)[1:]:
+                if letter in position:
+                    position[letter] = value
+            continue
+        if cmd == 'G4':
+            for letter, value in _gcode_words(upper)[1:]:
+                if letter == 'P':
+                    seconds += value / 1000.0
+                elif letter == 'S':
+                    seconds += value
+            continue
+        if cmd == 'G28':
+            for axis in position:
+                position[axis] = 0.0
+            continue
+        if cmd not in ('G0', 'G1'):
+            continue
+
+        squared = 0.0
+        for letter, value in _gcode_words(upper)[1:]:
+            if letter == 'F':
+                if value > 0:
+                    feed_mm_min = value
+                continue
+            if letter not in position:
+                continue
+            if absolute:
+                if position[letter] is not None:
+                    squared += (value - position[letter]) ** 2
+                position[letter] = value
+            else:
+                squared += value ** 2
+                if position[letter] is not None:
+                    position[letter] += value
+        if squared:
+            seconds += math.sqrt(squared) / (feed_mm_min / 60.0)
+
+    return seconds
+
+
+def direct_job_timeout_seconds(estimated_seconds: float) -> float:
+    """Stall timeout for a direct job: padded estimate, never below the floor."""
+    return max(DIRECT_JOB_MIN_TIMEOUT_SECONDS, estimated_seconds * DIRECT_JOB_TIMEOUT_FACTOR)
+
+
+# Done-marker strategy: a G-code line the printer echoes back as a field in
+# its MQTT status report. Only the progress marker is used:
+#   m73: M73 P<n> R0 -> mc_percent == n (and mc_remaining_time 0)
+MARKER_STRATEGIES = ('m73',)
+DEFAULT_MARKER_STRATEGY = 'm73'
+MARKER_CLEANUP_GCODE = {}
+
+
+def completion_marker_percent(baseline_pair=None) -> int:
+    """Pick an M73 percent that differs from the printer's current mc_percent."""
     baseline_percent = (baseline_pair or (None, None))[0]
     try:
-        start_percent = int(baseline_percent) % 100
+        return (int(baseline_percent) + 1) % 100
     except (TypeError, ValueError):
-        start_percent = 0
-
-    markers = [
-        {
-            'index': index,
-            'percent': (start_percent + index) % 100,
-            'remaining': 0,
-            'completed': False,
-        }
-        for index in range(1, marker_count + 1)
-    ]
-    return markers, batch_size, start_percent
+        return 1
 
 
-def progress_marker_lines(completed_commands: int, total_commands: int, marker):
-    """Create M73 marker lines after a completed batch."""
-    if total_commands <= 0:
-        return []
+def build_completion_marker(strategy: str, cached_print: dict):
+    """Return (gcode_line, report_field, expected_value, marker_percent) for a strategy.
 
-    return [
-        f"; bambucuts progress: {completed_commands}/{total_commands}",
-        "M400 ; wait for queued motion before reporting progress",
-        f"M73 P{marker['percent']} R{marker['remaining']}",
-        f"M73 L{marker['index']}",
-    ]
+    The expected value is chosen to differ from what the printer currently
+    reports, so the change is unambiguous.
+    """
+    percent = completion_marker_percent((cached_print.get('mc_percent'), cached_print.get('mc_remaining_time')))
+    return f"M73 P{percent} R0", 'mc_percent', str(percent), percent
 
 
-def add_m73_progress_markers(gcode_text: str, batch_size: int = PROGRESS_BATCH_SIZE, baseline_pair=None):
-    """Insert M73 progress markers after each batch of executable G-code."""
-    batch_size = clamp_progress_batch_size(batch_size)
-    lines = gcode_text.splitlines()
-    total_commands = sum(1 for line in lines if is_executable_gcode_line(line))
+def add_completion_marker(gcode_text: str, baseline_pair=None, default_feed_mm_min: float = 1000.0,
+                          start_position=None, strategy: str = DEFAULT_MARKER_STRATEGY):
+    """Append one M400 + done-marker line after the last executable line.
 
+    The M400 drains queued motion, so the printer echoing the marker over
+    MQTT means every move before it has finished. A single marker keeps the
+    motion continuous; per-batch markers would force a full stop at each one.
+    """
+    total_commands = sum(1 for _ in extract_executable_gcode(gcode_text))
     if total_commands == 0:
         return gcode_text, {
             'enabled': False,
-            'batch_size': batch_size,
             'command_count': 0,
-            'marker_count': 0,
-            'markers': [],
-            'start_percent': 0,
+            'marker_strategy': strategy,
+            'marker_field': None,
+            'marker_value': None,
+            'marker_percent': None,
+            'estimated_seconds': 0.0,
+            'timeout_seconds': 0.0,
         }
 
-    markers, batch_size, start_percent = build_progress_marker_plan(
-        total_commands, batch_size, baseline_pair=baseline_pair)
-    output_lines = ["; bambucuts progress start"]
-    completed_commands = 0
-    marker_index = 0
-
-    for line in lines:
-        output_lines.append(line)
-
-        if not is_executable_gcode_line(line):
-            continue
-
-        completed_commands += 1
-        if completed_commands % batch_size == 0 or completed_commands == total_commands:
-            marker_index += 1
-            marker = markers[marker_index - 1]
-            output_lines.extend(progress_marker_lines(
-                completed_commands,
-                total_commands,
-                marker,
-            ))
-
-    return '\n'.join(output_lines), {
+    with mqtt_status_lock:
+        cached_print = dict(state['mqtt_status'].get('print') or {})
+    if baseline_pair is not None:
+        cached_print['mc_percent'], cached_print['mc_remaining_time'] = baseline_pair
+    marker_line, marker_field, marker_value, marker_percent = build_completion_marker(strategy, cached_print)
+    estimated_seconds = estimate_gcode_seconds(gcode_text, default_feed_mm_min, start_position)
+    marker_lines = [
+        f"; bambucuts done marker: {total_commands} command(s)",
+        "M400 ; wait for queued motion to finish",
+        marker_line,
+    ]
+    return '\n'.join([gcode_text.rstrip('\n'), *marker_lines]), {
         'enabled': True,
-        'batch_size': batch_size,
         'command_count': total_commands,
-        'marker_count': marker_index,
-        'markers': markers,
-        'start_percent': start_percent,
+        'marker_strategy': strategy,
+        'marker_line': marker_line,
+        'marker_field': marker_field,
+        'marker_value': marker_value,
+        'marker_percent': marker_percent,
+        'estimated_seconds': round(estimated_seconds, 1),
+        'timeout_seconds': round(direct_job_timeout_seconds(estimated_seconds), 1),
     }
 
 
@@ -629,7 +784,7 @@ def _store_direct_job(job):
 
 
 def begin_direct_job(progress_info):
-    """Start tracking a direct-send job by its M73 checkpoints."""
+    """Start tracking a direct-send job by its final M73 checkpoint."""
     started_at = time.time()
     job = {
         'id': str(uuid.uuid4()),
@@ -640,33 +795,29 @@ def begin_direct_job(progress_info):
         'queued_at': None,
         'queued_count': 0,
         'command_count': progress_info.get('command_count', 0),
-        'marker_count': progress_info.get('marker_count', 0),
-        'markers': [dict(marker) for marker in progress_info.get('markers', [])],
-        'batch_size': progress_info.get('batch_size', PROGRESS_BATCH_SIZE),
-        'start_percent': progress_info.get('start_percent', 0),
-        'last_marker_index': 0,
-        'logical_percent': 0,
+        'marker_percent': progress_info.get('marker_percent'),
+        'marker_strategy': progress_info.get('marker_strategy', DEFAULT_MARKER_STRATEGY),
+        'marker_line': progress_info.get('marker_line'),
+        'marker_field': progress_info.get('marker_field', 'mc_percent'),
+        'marker_value': progress_info.get('marker_value'),
+        'estimated_seconds': progress_info.get('estimated_seconds', 0.0),
+        'timeout_seconds': progress_info.get('timeout_seconds', DIRECT_JOB_MIN_TIMEOUT_SECONDS),
         'last_percent': None,
         'last_remaining_time': None,
         'last_update': None,
-        'message': 'Queueing G-code and waiting for M73 checkpoints',
+        'message': 'Queueing G-code and waiting for the final M73 checkpoint',
     }
 
-    shown = job['markers'] if len(job['markers']) <= 8 else job['markers'][:7] + job['markers'][-1:]
-    expected = ', '.join(
-        f"#{marker['index']}: P{marker['percent']}"
-        for marker in shown
-    )
-    if len(job['markers']) > 8:
-        expected = expected.replace(f", #{job['markers'][-1]['index']}:", f", ..., #{job['markers'][-1]['index']}:")
     print(f"Direct job {job['id']} started: {job['command_count']} command(s), "
-          f"expecting {job['marker_count']} M73 checkpoint(s): {expected}")
+          f"marker '{job['marker_line']}' expecting {job['marker_field']}={job['marker_value']}, "
+          f"estimated {job['estimated_seconds']}s, timeout {job['timeout_seconds']}s")
 
     with mqtt_status_lock:
         cached_print = dict(state['mqtt_status'].get('print') or {})
-        cached_print['mc_percent'] = None
-        cached_print['mc_remaining_time'] = None
-        cached_print['layer_num'] = None
+        cached_print[job['marker_field']] = None
+        if job['marker_field'] == 'mc_percent':
+            cached_print['mc_remaining_time'] = None
+            cached_print['layer_num'] = None
         state['mqtt_status']['print'] = cached_print
 
     with direct_job_lock:
@@ -691,6 +842,7 @@ def mark_direct_job_queued(job_id, queued_count, errors):
 
         job['queued_at'] = time.time()
         job['queued_count'] = queued_count
+        job['pushalls_at_queue'] = mqtt_pushall_stats.get('pushall_count', 0)
         if errors:
             job['active'] = False
             job['status'] = 'queue_error'
@@ -698,7 +850,7 @@ def mark_direct_job_queued(job_id, queued_count, errors):
             job['errors'] = errors
         else:
             job['status'] = 'waiting'
-            job['message'] = 'Queued; waiting for printer to reach M73 checkpoints'
+            job['message'] = 'Queued; waiting for printer to reach the final M73 checkpoint'
 
         state['direct_job'] = job
         _store_direct_job(job)
@@ -706,27 +858,26 @@ def mark_direct_job_queued(job_id, queued_count, errors):
 
 
 def _apply_stall_timeout(job, mqtt_progress):
-    """Fail a queued job that waited too long for its next checkpoint.
+    """Fail a queued job that waited longer than its estimated run time allows.
 
-    Without this a job whose checkpoints never arrive - a dead MQTT feed, a
+    Without this a job whose checkpoint never arrives - a dead MQTT feed, a
     cancelled print - stays 'active' forever. Caller holds direct_job_lock.
     """
     queued_at = job.get('queued_at')
     if not job.get('active') or not queued_at:
         return job
 
-    waited = time.time() - (job.get('last_update') or queued_at)
-    if waited < DIRECT_JOB_STALL_SECONDS:
+    waited = time.time() - queued_at
+    timeout = job.get('timeout_seconds') or DIRECT_JOB_MIN_TIMEOUT_SECONDS
+    if waited < timeout:
         return job
 
-    marker_index = job.get('last_marker_index') or 0
-    marker_count = job.get('marker_count') or 0
-    reason = mqtt_progress.get('stale_reason') or f'no checkpoint for {waited:.0f}s'
+    reason = mqtt_progress.get('stale_reason') or f'no checkpoint after {waited:.0f}s (timeout {timeout:.0f}s)'
 
     job['active'] = False
     job['status'] = 'stalled'
     job['completed_at'] = time.time()
-    job['message'] = f'Stopped waiting at checkpoint {marker_index}/{marker_count}: {reason}'
+    job['message'] = f'Stopped waiting for the final checkpoint: {reason}'
     print(f"Direct job {job.get('id')} stalled: {job['message']}")
 
     state['direct_job'] = job
@@ -745,55 +896,85 @@ def update_direct_job_from_mqtt(mqtt_progress):
         progress_update = mqtt_progress.get('last_update')
         percent = mqtt_progress.get('percent')
         remaining_time = mqtt_progress.get('remaining_time')
+        field = job.get('marker_field') or 'mc_percent'
+        reported = (mqtt_progress.get('print') or {}).get(field)
         if mqtt_progress.get('stale'):
             return _apply_stall_timeout(job, mqtt_progress)
-        if progress_update is None or progress_update < job.get('started_at', 0) or percent is None:
+        if progress_update is None or progress_update < job.get('started_at', 0) or reported is None:
             return _apply_stall_timeout(job, mqtt_progress)
 
-        # Checkpoint percents form a wrapping counter: percent = (start + index)
-        # % 100. Resolve the reported percent to the nearest checkpoint at or
-        # after the last one seen, so progress only ever counts up. Our M73
-        # markers always send R0, so a nonzero remaining time is not ours.
-        if remaining_time is not None and remaining_time != 0:
+        if field == 'mc_percent':
+            # Our marker always sends R0, so a nonzero remaining time is not ours.
+            if remaining_time is not None and remaining_time != 0:
+                return _apply_stall_timeout(job, mqtt_progress)
+        if str(reported) != str(job.get('marker_value')):
             return _apply_stall_timeout(job, mqtt_progress)
 
-        marker_count = job.get('marker_count') or 0
-        start_percent = job.get('start_percent') or 0
-        previous_marker_index = job.get('last_marker_index') or 0
-
-        steps_ahead = (percent - start_percent - previous_marker_index) % 100
-        if steps_ahead == 0:
-            return _apply_stall_timeout(job, mqtt_progress)
-        marker_index = previous_marker_index + steps_ahead
-        if marker_index > marker_count:
-            return _apply_stall_timeout(job, mqtt_progress)
-
-        markers = [dict(marker) for marker in job.get('markers', [])]
-        for marker in markers[:marker_index]:
-            marker['completed'] = True
-        job['markers'] = markers
-
-        print(f"Checkpoint {marker_index}/{marker_count} reached "
-              f"(printer reported P{percent} R{remaining_time})")
+        meta = mqtt_progress.get('report_meta') or {}
+        detect_seconds = round(progress_update - job['queued_at'], 3) if job.get('queued_at') else None
         job['last_percent'] = percent
         job['last_remaining_time'] = remaining_time
-        job['last_marker_index'] = marker_index
-        job['logical_percent'] = round((marker_index / marker_count) * 100) if marker_count else 0
         job['last_update'] = progress_update
-
-        if marker_count and marker_index >= marker_count:
-            job['active'] = False
-            job['status'] = 'complete'
-            job['completed_at'] = progress_update
-            job['message'] = 'Direct G-code execution reached final M73 checkpoint'
-            print("Done.")
-        else:
-            job['status'] = 'running'
-            job['message'] = f'Direct G-code reached checkpoint {marker_index}/{marker_count}'
+        job['active'] = False
+        job['status'] = 'complete'
+        job['completed_at'] = progress_update
+        job['detect_seconds'] = detect_seconds
+        job['detect_report_kind'] = 'pushall' if meta.get('pushall_matched') else 'delta'
+        job['detect_pushall_rtt'] = round(meta['pushall_rtt'], 3) if meta.get('pushall_rtt') is not None else None
+        job['detect_since_pushall'] = round(meta['since_last_pushall'], 3) if meta.get('since_last_pushall') is not None else None
+        job['pushalls_sent'] = max(0, meta.get('pushall_count', 0) - job.get('pushalls_at_queue', 0))
+        job['message'] = 'Direct G-code execution reached the final done marker'
+        print(f"Final checkpoint reached: {field}={reported} at +{detect_seconds}s after queue, "
+              f"via {job['detect_report_kind']} (rtt {job['detect_pushall_rtt']}s, "
+              f"since last pushall {job['detect_since_pushall']}s), "
+              f"{job['pushalls_sent']} pushalls sent during job. Done.")
 
         state['direct_job'] = job
         _store_direct_job(job)
         return job.copy()
+
+
+def current_mqtt_progress():
+    """Snapshot the cached MQTT print status as the progress dict used for job tracking."""
+    with mqtt_status_lock:
+        mqtt_status = {
+            'connected': state['mqtt_status'].get('connected'),
+            'error': state['mqtt_status'].get('error'),
+            'last_update': state['mqtt_status'].get('last_update'),
+            'print': dict(state['mqtt_status'].get('print') or {}),
+        }
+        report_meta = dict(state['mqtt_status'].get('last_report_meta') or {})
+
+    mqtt_print = mqtt_status['print']
+    last_update = mqtt_status.get('last_update')
+    health = mqtt_feed_health(last_update)
+    # A stale feed is a dead feed, whatever the cached flag says.
+    mqtt_live = bool(mqtt_status.get('connected')) and not health['stale']
+    mqtt_status['connected'] = mqtt_live
+    mqtt_status['stale'] = health['stale']
+    if health['stale'] and not mqtt_status.get('error'):
+        mqtt_status['error'] = health['reason']
+    mqtt_progress = {
+        'percent': mqtt_print.get('mc_percent'),
+        'remaining_time': mqtt_print.get('mc_remaining_time'),
+        'layer_num': mqtt_print.get('layer_num'),
+        'total_layer_num': mqtt_print.get('total_layer_num'),
+        'print_line_number': mqtt_print.get('mc_print_line_number'),
+        'print_stage': mqtt_print.get('mc_print_stage'),
+        'print_sub_stage': mqtt_print.get('mc_print_sub_stage'),
+        'gcode_state': mqtt_print.get('gcode_state'),
+        'print_type': mqtt_print.get('print_type'),
+        'last_update': last_update,
+        'age': health['age'],
+        'stale': health['stale'],
+        'stale_reason': health['reason'],
+        'listener_alive': health['listener_alive'],
+        'mqtt_connected': mqtt_live,
+        'mqtt_error': mqtt_status.get('error'),
+        'report_meta': report_meta,
+        'print': mqtt_print,
+    }
+    return mqtt_status, mqtt_progress
 
 
 def _bounded_query_float(name: str, default: float, minimum: float, maximum: float) -> float:
@@ -839,43 +1020,11 @@ def get_status():
         except Exception as e:
             print(f"Error getting printer state: {e}")
 
-    with mqtt_status_lock:
-        mqtt_status = {
-            'connected': state['mqtt_status'].get('connected'),
-            'error': state['mqtt_status'].get('error'),
-            'last_update': state['mqtt_status'].get('last_update'),
-            'print': dict(state['mqtt_status'].get('print') or {}),
-        }
-
-    mqtt_print = mqtt_status['print']
-    last_update = mqtt_status.get('last_update')
-    health = mqtt_feed_health(last_update)
-    # A stale feed is a dead feed, whatever the cached flag says.
-    mqtt_live = bool(mqtt_status.get('connected')) and not health['stale']
-    mqtt_status['connected'] = mqtt_live
-    mqtt_status['stale'] = health['stale']
-    if health['stale'] and not mqtt_status.get('error'):
-        mqtt_status['error'] = health['reason']
-    mqtt_progress = {
-        'percent': mqtt_print.get('mc_percent'),
-        'remaining_time': mqtt_print.get('mc_remaining_time'),
-        'layer_num': mqtt_print.get('layer_num'),
-        'total_layer_num': mqtt_print.get('total_layer_num'),
-        'print_line_number': mqtt_print.get('mc_print_line_number'),
-        'print_stage': mqtt_print.get('mc_print_stage'),
-        'print_sub_stage': mqtt_print.get('mc_print_sub_stage'),
-        'gcode_state': mqtt_print.get('gcode_state'),
-        'print_type': mqtt_print.get('print_type'),
-        'last_update': last_update,
-        'age': health['age'],
-        'stale': health['stale'],
-        'stale_reason': health['reason'],
-        'listener_alive': health['listener_alive'],
-        'mqtt_connected': mqtt_live,
-        'mqtt_error': mqtt_status.get('error'),
-    }
-
+    mqtt_status, mqtt_progress = current_mqtt_progress()
     direct_job = update_direct_job_from_mqtt(mqtt_progress)
+    # The per-report timeline can be hundreds of entries; keep the 1 Hz status
+    # poll light and leave the full record to /api/gcode/jobs/<id>.
+    direct_job = {k: v for k, v in direct_job.items() if k != 'reports'}
 
     return jsonify({
         'position': state['position'],
@@ -1393,29 +1542,32 @@ def format_gcode():
     })
 
 
-@app.route('/api/gcode/send-all', methods=['POST'])
-def send_all_gcode():
-    """Send all G-code lines from editor."""
-    data = request.json
-    gcode_text = data.get('gcode', '')
-    progress_markers = data.get('progress_markers', True)
-    progress_batch_size = clamp_progress_batch_size(data.get('progress_batch_size', PROGRESS_BATCH_SIZE))
+def queue_direct_gcode(gcode_text: str, single_call: bool = False, progress_markers: bool = True,
+                       start_position=None, marker_strategy: str = DEFAULT_MARKER_STRATEGY):
+    """Queue G-code on the printer as a tracked direct job.
 
-    if not gcode_text.strip():
-        return jsonify({'success': False, 'error': 'No G-code to send'}), 400
-
+    Returns the same dict the send-all endpoint reports. When progress
+    markers are on and the printer is connected, the returned 'direct_job'
+    can be followed to completion with wait_for_direct_job(). The run-time
+    estimate starts from `start_position`, defaulting to the jog-tracked
+    position so the first move's travel is counted.
+    """
+    if start_position is None:
+        start_position = dict(state['position'])
     progress_info = {
         'enabled': False,
-        'batch_size': progress_batch_size,
         'command_count': sum(1 for _ in extract_executable_gcode(gcode_text)),
-        'marker_count': 0,
+        'marker_percent': None,
+        'estimated_seconds': round(estimate_gcode_seconds(gcode_text, state['feed_rate'], start_position), 1),
+        'timeout_seconds': 0.0,
     }
     gcode_to_send = gcode_text
     if progress_markers:
-        gcode_to_send, progress_info = add_m73_progress_markers(
+        gcode_to_send, progress_info = add_completion_marker(
             gcode_text,
-            progress_batch_size,
-            baseline_pair=current_mqtt_marker_pair(),
+            default_feed_mm_min=state['feed_rate'],
+            start_position=start_position,
+            strategy=marker_strategy,
         )
 
     sent_count = 0
@@ -1425,38 +1577,372 @@ def send_all_gcode():
     if state['printer_connected'] and progress_info.get('enabled'):
         direct_job = begin_direct_job(progress_info)
 
-    for line_num, line in extract_executable_gcode(gcode_to_send):
-        # Add to history
-        add_to_history(line)
+    executable_lines = list(extract_executable_gcode(gcode_to_send))
+    payload_bytes = 0
 
-        # Send to printer if connected
+    if single_call:
+        # Ship every line in a single MQTT gcode_line command instead of one
+        # publish per line.
+        lines = [line for _, line in executable_lines]
+        for line in lines:
+            add_to_history(line)
+
+        queued_count = len(lines)
+        sent_count = sum(
+            1 for line in lines if not line.upper().startswith(('M73', 'M400')))
+        payload_bytes = len('\n'.join(lines).encode('utf-8'))
+
         if state['printer_connected']:
-            success = send_gcode_to_printer(line)
-            if not success:
-                errors.append(f"Line {line_num}: Failed to send")
+            if not send_gcode_lines_to_printer(lines):
+                errors.append(f"Failed to send {queued_count} lines in one call")
+    else:
+        for line_num, line in executable_lines:
+            # Add to history
+            add_to_history(line)
 
-        queued_count += 1
-        if not line.upper().startswith(('M73', 'M400')):
-            sent_count += 1
-        time.sleep(0.05)  # Small delay between commands
+            # Send to printer if connected
+            if state['printer_connected']:
+                success = send_gcode_to_printer(line)
+                if not success:
+                    errors.append(f"Line {line_num}: Failed to send")
+
+            queued_count += 1
+            if not line.upper().startswith(('M73', 'M400')):
+                sent_count += 1
+            time.sleep(0.05)  # Small delay between commands
 
     if direct_job:
         direct_job = mark_direct_job_queued(direct_job['id'], queued_count, errors)
 
-    return jsonify({
+    return {
         'success': len(errors) == 0,
         'sent_count': sent_count,
         'queued_count': queued_count,
+        'single_call': single_call,
+        'payload_bytes': payload_bytes,
         'progress': progress_info,
         'direct_job': direct_job,
         'job_id': direct_job['id'] if direct_job else None,
         'errors': errors
+    }
+
+
+def wait_for_direct_job(job_id: str, poll_seconds: float = 0.02, stop_event=None):
+    """Block until the direct job leaves the active state, then return it.
+
+    The MQTT callback resolves completion on its own; this loop also re-runs
+    the stall check so a dead feed still ends the wait.
+    """
+    while True:
+        with direct_job_lock:
+            job = dict(state.get('direct_jobs', {}).get(job_id) or {})
+        if not job:
+            return None
+        if not job.get('active'):
+            return job
+        if stop_event is not None and stop_event.is_set():
+            return job
+        _, mqtt_progress = current_mqtt_progress()
+        update_direct_job_from_mqtt(mqtt_progress)
+        time.sleep(poll_seconds)
+
+
+@app.route('/api/gcode/send-all', methods=['POST'])
+def send_all_gcode():
+    """Send all G-code lines from editor."""
+    data = request.json
+    gcode_text = data.get('gcode', '')
+    progress_markers = data.get('progress_markers', True)
+    single_call = bool(data.get('single_call', False))
+
+    if not gcode_text.strip():
+        return jsonify({'success': False, 'error': 'No G-code to send'}), 400
+
+    return jsonify(queue_direct_gcode(gcode_text, single_call=single_call, progress_markers=progress_markers))
+
+
+# ---------------------------------------------------------------------------
+# Done-signal latency benchmark
+# ---------------------------------------------------------------------------
+
+BENCHMARK_SETUP_XY = (10.0, 10.0)
+BENCHMARK_TARGET_XY = (110.0, 110.0)
+
+benchmark_lock = threading.Lock()
+benchmark_thread = None
+benchmark_stop_event = threading.Event()
+
+
+def _summarize(values):
+    values = [v for v in values if v is not None]
+    if not values:
+        return {'count': 0}
+    summary = {
+        'count': len(values),
+        'min': round(min(values), 3),
+        'max': round(max(values), 3),
+        'mean': round(statistics.fmean(values), 3),
+        'median': round(statistics.median(values), 3),
+    }
+    summary['stdev'] = round(statistics.stdev(values), 3) if len(values) > 1 else 0.0
+    return summary
+
+
+def build_benchmark_gcode(line_count: int, feed_mm_min: float, distance_mm: float = None) -> str:
+    """Move from the setup point to the target in `line_count` equal steps.
+
+    distance_mm overrides the per-axis travel; 0 gives a zero-motion batch
+    that measures pure command-processing and reporting latency.
+    """
+    (x0, y0), (x1, y1) = BENCHMARK_SETUP_XY, BENCHMARK_TARGET_XY
+    if distance_mm is not None:
+        x1, y1 = x0 + distance_mm, y0 + distance_mm
+    line_count = max(1, int(line_count))
+    lines = []
+    for step in range(1, line_count + 1):
+        frac = step / line_count
+        x = x0 + (x1 - x0) * frac
+        y = y0 + (y1 - y0) * frac
+        feed = f" F{feed_mm_min:.0f}" if step == 1 else ""
+        lines.append(f"G1 X{x:.3f} Y{y:.3f}{feed}")
+    return '\n'.join(lines)
+
+
+def _benchmark_one(gcode_text: str, single_call: bool, stop_event, start_position=None,
+                   marker_strategy: str = DEFAULT_MARKER_STRATEGY):
+    """Queue one batch, wait for its done signal, and time each phase."""
+    t_send = time.perf_counter()
+    result = queue_direct_gcode(gcode_text, single_call=single_call, start_position=start_position,
+                                marker_strategy=marker_strategy)
+    t_queued = time.perf_counter()
+    if not result['success'] or not result['job_id']:
+        return {
+            'ok': False,
+            'error': '; '.join(result['errors']) or 'no direct job created (printer connected?)',
+            'queue_seconds': round(t_queued - t_send, 3),
+        }
+    job = wait_for_direct_job(result['job_id'], stop_event=stop_event)
+    t_done = time.perf_counter()
+    ok = bool(job) and job.get('status') == 'complete'
+    job = job or {}
+    return {
+        'ok': ok,
+        'status': job.get('status', 'missing'),
+        'error': None if ok else job.get('message'),
+        'queue_seconds': round(t_queued - t_send, 3),
+        'wait_seconds': round(t_done - t_queued, 3),
+        'total_seconds': round(t_done - t_send, 3),
+        'estimated_motion_seconds': result['progress'].get('estimated_seconds'),
+        'detect_seconds': job.get('detect_seconds'),
+        'detect_report_kind': job.get('detect_report_kind'),
+        'detect_pushall_rtt': job.get('detect_pushall_rtt'),
+        'detect_since_pushall': job.get('detect_since_pushall'),
+        'pushalls_sent': job.get('pushalls_sent'),
+        'reports': list(job.get('reports') or []),
+    }
+
+
+def run_direct_latency_benchmark(iterations: int = 10, line_counts=(1, 10), feed_mm_min=None,
+                                 single_call: bool = True, stop_event=None, distance_mm=None,
+                                 marker_strategy: str = DEFAULT_MARKER_STRATEGY, pushall_interval=None):
+    """Measure how long the done signal takes after queueing a direct batch.
+
+    Each iteration first parks the head at BENCHMARK_SETUP_XY as its own job,
+    then times a fresh job that moves to BENCHMARK_TARGET_XY in `line_count`
+    lines. 'overhead' is wait time minus the estimated motion time, which is
+    roughly the round trip through the printer's queue, M400, M73, and MQTT.
+    """
+    stop_event = stop_event or threading.Event()
+    feed_mm_min = float(feed_mm_min or state['feed_rate'])
+    iterations = max(1, int(iterations))
+    x0, y0 = BENCHMARK_SETUP_XY
+    setup_gcode = f"G90\nG1 X{x0:.3f} Y{y0:.3f} F{feed_mm_min:.0f}"
+
+    report = {
+        'status': 'running',
+        'started_at': time.time(),
+        'finished_at': None,
+        'iterations': iterations,
+        'feed_mm_min': feed_mm_min,
+        'single_call': single_call,
+        'setup_xy': BENCHMARK_SETUP_XY,
+        'target_xy': BENCHMARK_TARGET_XY if distance_mm is None else (x0 + distance_mm, y0 + distance_mm),
+        'distance_mm': distance_mm,
+        'marker_strategy': marker_strategy,
+        'pushall_interval': pushall_interval if pushall_interval is not None else DIRECT_JOB_STATUS_POLL_INTERVAL,
+        'cases': [],
+        'error': None,
+    }
+    with benchmark_lock:
+        state['benchmark'] = dict(report)
+    previous_interval = state.get('pushall_interval')
+    if pushall_interval is not None:
+        state['pushall_interval'] = pushall_interval
+
+    def publish():
+        with benchmark_lock:
+            state['benchmark'] = json.loads(json.dumps(report))
+
+    try:
+        for line_count in line_counts:
+            batch_gcode = build_benchmark_gcode(line_count, feed_mm_min, distance_mm)
+            case = {'line_count': int(line_count), 'gcode': batch_gcode, 'runs': [], 'stats': {}}
+            report['cases'].append(case)
+            for run_index in range(1, iterations + 1):
+                if stop_event.is_set():
+                    raise RuntimeError('benchmark stopped')
+                setup = _benchmark_one(setup_gcode, single_call, stop_event, marker_strategy=marker_strategy)
+                if not setup['ok']:
+                    raise RuntimeError(f"setup move failed on run {run_index}: {setup.get('error')}")
+                run = _benchmark_one(batch_gcode, single_call, stop_event,
+                                     start_position={'x': x0, 'y': y0}, marker_strategy=marker_strategy)
+                run['run'] = run_index
+                if run['ok']:
+                    run['overhead_seconds'] = round(
+                        run['wait_seconds'] - (run['estimated_motion_seconds'] or 0.0), 3)
+                case['runs'].append(run)
+                print(f"Benchmark {line_count}-line run {run_index}/{iterations}: "
+                      f"queue {run['queue_seconds']}s, wait {run.get('wait_seconds')}s, "
+                      f"detected via {run.get('detect_report_kind')} rtt {run.get('detect_pushall_rtt')}s, "
+                      f"{run.get('pushalls_sent')} pushalls, status {run.get('status')}")
+                publish()
+                if not run['ok']:
+                    raise RuntimeError(f"measured batch failed on run {run_index}: {run.get('error')}")
+
+            ok_runs = [r for r in case['runs'] if r['ok']]
+            case['stats'] = {
+                'queue_seconds': _summarize([r['queue_seconds'] for r in ok_runs]),
+                'wait_seconds': _summarize([r['wait_seconds'] for r in ok_runs]),
+                'total_seconds': _summarize([r['total_seconds'] for r in ok_runs]),
+                'overhead_seconds': _summarize([r['overhead_seconds'] for r in ok_runs]),
+                'pushall_rtt': _summarize([r['detect_pushall_rtt'] for r in ok_runs]),
+                'pushalls_sent': _summarize([r['pushalls_sent'] for r in ok_runs]),
+                'detected_via': {
+                    kind: sum(1 for r in ok_runs if r.get('detect_report_kind') == kind)
+                    for kind in ('pushall', 'delta')
+                },
+                'estimated_motion_seconds': ok_runs[0]['estimated_motion_seconds'] if ok_runs else None,
+            }
+            print(f"Benchmark {line_count}-line stats: {case['stats']}")
+        report['status'] = 'complete'
+    except Exception as e:
+        report['status'] = 'failed'
+        report['error'] = str(e)
+        print(f"Benchmark failed: {e}")
+    finally:
+        if pushall_interval is not None:
+            if previous_interval is None:
+                state.pop('pushall_interval', None)
+            else:
+                state['pushall_interval'] = previous_interval
+        cleanup = MARKER_CLEANUP_GCODE.get(marker_strategy)
+        if cleanup and state['printer_connected']:
+            send_gcode_to_printer(cleanup)
+            print(f"Benchmark cleanup sent: {cleanup}")
+        report['finished_at'] = time.time()
+        publish()
+    return report
+
+
+@app.route('/api/gcode/benchmark', methods=['POST'])
+def start_direct_latency_benchmark():
+    """Start the done-signal latency benchmark in the background.
+
+    Body (all optional): iterations (default 10), line_counts (default [1, 10]),
+    feed_rate in mm/min (default: current jog feed rate), single_call (default true).
+    Poll GET /api/gcode/benchmark for progress and results.
+    """
+    global benchmark_thread
+
+    if not state['printer_connected']:
+        return jsonify({'success': False, 'error': 'Printer not connected'}), 400
+    if benchmark_thread and benchmark_thread.is_alive():
+        return jsonify({'success': False, 'error': 'Benchmark already running'}), 409
+
+    data = request.json or {}
+    iterations = _bounded_body_int(data, 'iterations', 10, 1, 100)
+    try:
+        line_counts = [max(1, min(500, int(v))) for v in data.get('line_counts', [1, 10])]
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'line_counts must be a list of integers'}), 400
+    if not line_counts:
+        return jsonify({'success': False, 'error': 'line_counts must not be empty'}), 400
+    try:
+        feed_mm_min = float(data.get('feed_rate') or state['feed_rate'])
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'feed_rate must be a number'}), 400
+    single_call = bool(data.get('single_call', True))
+    distance_mm = data.get('distance_mm')
+    if distance_mm is not None:
+        try:
+            distance_mm = max(0.0, min(200.0, float(distance_mm)))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'distance_mm must be a number'}), 400
+
+    pushall_interval = data.get('pushall_interval')
+    if pushall_interval is not None:
+        try:
+            pushall_interval = max(0.02, min(10.0, float(pushall_interval)))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'pushall_interval must be seconds'}), 400
+    marker_strategy = str(data.get('marker', DEFAULT_MARKER_STRATEGY))
+    if marker_strategy not in MARKER_STRATEGIES:
+        return jsonify({'success': False, 'error': f'marker must be one of {list(MARKER_STRATEGIES)}'}), 400
+
+    benchmark_stop_event.clear()
+    benchmark_thread = threading.Thread(
+        target=run_direct_latency_benchmark,
+        kwargs={
+            'iterations': iterations,
+            'line_counts': line_counts,
+            'feed_mm_min': feed_mm_min,
+            'single_call': single_call,
+            'stop_event': benchmark_stop_event,
+            'distance_mm': distance_mm,
+            'marker_strategy': marker_strategy,
+            'pushall_interval': pushall_interval,
+        },
+        daemon=True,
+    )
+    benchmark_thread.start()
+    return jsonify({
+        'success': True,
+        'message': f'Benchmark started: {iterations} iteration(s) for line counts {line_counts}',
+        'iterations': iterations,
+        'line_counts': line_counts,
+        'feed_rate': feed_mm_min,
+        'single_call': single_call,
     })
+
+
+@app.route('/api/gcode/benchmark', methods=['GET'])
+def get_direct_latency_benchmark():
+    """Return the latest benchmark report, including per-run timings and stats."""
+    with benchmark_lock:
+        report = state.get('benchmark')
+    if not report:
+        return jsonify({'success': False, 'error': 'No benchmark has been run'}), 404
+    return jsonify({'success': True, 'benchmark': report})
+
+
+@app.route('/api/gcode/benchmark/stop', methods=['POST'])
+def stop_direct_latency_benchmark():
+    """Ask a running benchmark to stop after the current wait."""
+    benchmark_stop_event.set()
+    return jsonify({'success': True})
+
+
+def _bounded_body_int(data, name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(data.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
 
 
 @app.route('/api/gcode/jobs', methods=['GET'])
 def list_direct_jobs():
-    """List recent direct-send jobs with their per-batch completion status."""
+    """List recent direct-send jobs with their completion status."""
     with direct_job_lock:
         jobs = [dict(job) for job in state.get('direct_jobs', {}).values()]
     return jsonify({'jobs': jobs})
@@ -1480,7 +1966,6 @@ def send_all_gcode_3mf():
     gcode_text = data.get('gcode', '')
     filename = data.get('filename', 'plot.gcode')
     progress_markers = data.get('progress_markers', True)
-    progress_batch_size = clamp_progress_batch_size(data.get('progress_batch_size', PROGRESS_BATCH_SIZE))
 
     if not gcode_text.strip():
         return jsonify({'success': False, 'error': 'No G-code to send'}), 400
@@ -1496,16 +1981,17 @@ def send_all_gcode_3mf():
     try:
         progress_info = {
             'enabled': False,
-            'batch_size': progress_batch_size,
             'command_count': sum(1 for _ in extract_executable_gcode(gcode_text)),
-            'marker_count': 0,
+            'marker_percent': None,
+            'estimated_seconds': round(estimate_gcode_seconds(gcode_text, state['feed_rate']), 1),
+            'timeout_seconds': 0.0,
         }
         gcode_to_package = gcode_text
         if progress_markers:
-            gcode_to_package, progress_info = add_m73_progress_markers(
+            gcode_to_package, progress_info = add_completion_marker(
                 gcode_text,
-                progress_batch_size,
                 baseline_pair=current_mqtt_marker_pair(),
+                default_feed_mm_min=state['feed_rate'],
             )
 
         # Save G-code to temporary file
@@ -1569,7 +2055,6 @@ def create_3mf():
     gcode_text = data.get('gcode', '')
     filename = data.get('filename', 'plot.gcode')
     progress_markers = data.get('progress_markers', True)
-    progress_batch_size = clamp_progress_batch_size(data.get('progress_batch_size', PROGRESS_BATCH_SIZE))
 
     if not gcode_text.strip():
         return jsonify({'success': False, 'error': 'No G-code to convert'}), 400
@@ -1582,10 +2067,10 @@ def create_3mf():
     try:
         gcode_to_package = gcode_text
         if progress_markers:
-            gcode_to_package, _ = add_m73_progress_markers(
+            gcode_to_package, _ = add_completion_marker(
                 gcode_text,
-                progress_batch_size,
                 baseline_pair=current_mqtt_marker_pair(),
+                default_feed_mm_min=state['feed_rate'],
             )
 
         # Save G-code to temporary file

@@ -194,16 +194,35 @@ curl -N "http://localhost:5425/api/mqtt-stream?seconds=60&count=0"
 
 `M73 P<percent> R<remaining>` updates the printer's MQTT progress fields, such as `mc_percent` and `mc_remaining_time`.
 
-When G-code is sent from the web UI, Bambu Cuts injects progress markers after batches of commands:
+When G-code is sent from the web UI, Bambu Cuts appends one done marker after the last command:
 
 ```gcode
 M400
-M73 P32 R8
+M73 P43 R0
 ```
 
-`M400` waits for queued motion to finish before the `M73` marker runs, so seeing the matching `mc_percent` and `mc_remaining_time` pair in MQTT means the printer has completed the previous batch.
+`M400` waits for all queued motion to finish before the `M73` runs, so seeing that exact `mc_percent` with `mc_remaining_time` = 0 in MQTT means the whole batch has completed. The percent is chosen as the printer's current `mc_percent` + 1 so it always produces a fresh MQTT delta. Only a single marker is used, because every `M400` forces the planner to a full stop, which would leave a pen dwell or laser spot at each checkpoint.
 
-For `Print Direct`, the web UI tracks the active direct job separately. The send action only means the G-code was queued; execution is considered done when MQTT reports the exact final `M73 P... R...` checkpoint for that job. Checkpoint values are chosen so each marker changes and the first/final checkpoint do not reuse the cached stale MQTT value.
+`Print Direct` has a `Single call` checkbox. Unchecked (default), each line is published as its own MQTT `gcode_line` command with a 50 ms gap between them. Checked, all lines are joined with newlines and published in a single `gcode_line` command, which is much faster to queue but sends one large MQTT payload the printer may reject if it is too big.
+
+For `Print Direct`, the web UI tracks the active direct job separately. The send action only means the G-code was queued; the job is marked `complete` the moment the MQTT listener sees the final marker, whether or not a browser is polling. While a job is active the listener also sends the printer a `pushall` request twice per second, which keeps the printer emitting a full report about once per second instead of on its own multi-second cadence. The printer never answers faster than once per second however often it is asked, and rates of 10 Hz or more measured slightly slower detection. If the marker does not arrive within the estimated run time × 1.5 (minimum 30 s), the job is marked `stalled`. The estimate sums move distance divided by the modal feed rate plus `G4` dwells, ignoring acceleration. Jobs are queryable at `/api/gcode/jobs` and `/api/gcode/jobs/<id>`.
+
+### Done-signal latency benchmark
+
+To measure how long the done signal takes to arrive after queueing, run the benchmark with the printer connected. Each iteration parks the head at X10 Y10 as its own job, then times a fresh job that moves to X110 Y110 in 1 line and again in 10 lines, and reports min/max/mean/median/stdev for queue time, wait time, and overhead (wait minus estimated motion time):
+
+```bash
+curl -X POST http://localhost:5425/api/gcode/benchmark \
+  -H 'Content-Type: application/json' \
+  -d '{"iterations": 10, "line_counts": [1, 10], "feed_rate": 3000, "single_call": true}'
+curl http://localhost:5425/api/gcode/benchmark      # progress and results
+curl -X POST http://localhost:5425/api/gcode/benchmark/stop
+```
+
+The head must have clear travel between those points and Z is not touched, so lift the pen first. Add `"distance_mm": 0` to make the measured batch a zero-motion move, which isolates the printer's command and reporting latency from motion time.
+
+While a job is active the server log prints one line per MQTT report (`MQTT report +1.850s ...`) with the time since queueing, whether it answered one of our pushalls, and the progress fields it carried. The same timeline is stored per run in the benchmark result under `reports`. Measured on an A1 in September 2026: the printer answers pushall at most once per second however often it is asked, and its status snapshot picks up an executed `M73` about 1 to 2 seconds late, so the done signal trails the end of motion by roughly 0.5 to 3 seconds (median about 1.7 s) and cannot be made faster from the client side.
+
 
 ## My process 
 

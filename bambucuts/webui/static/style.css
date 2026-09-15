@@ -1079,6 +1079,63 @@ header h1 {
     flex-wrap: wrap;
 }
 
+.editor-option {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    cursor: pointer;
+    user-select: none;
+}
+
+.editor-option input {
+    cursor: pointer;
+    accent-color: var(--accent-secondary);
+}
+
+.job-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 0.95rem;
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    background: var(--bg-primary);
+}
+
+.job-indicator.waiting {
+    color: var(--accent-secondary);
+    border-color: var(--accent-secondary);
+}
+
+.job-indicator.done {
+    color: #4caf50;
+    border-color: #4caf50;
+}
+
+.job-indicator.failed {
+    color: var(--accent-primary);
+    border-color: var(--accent-primary);
+}
+
+.benchmark-result {
+    margin-top: 12px;
+    padding: 12px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    color: var(--text-primary);
+    font-family: 'Courier New', monospace;
+    font-size: 0.85rem;
+    line-height: 1.4;
+    white-space: pre;
+    overflow-x: auto;
+}
+
 .editor-info {
     display: flex;
     align-items: center;

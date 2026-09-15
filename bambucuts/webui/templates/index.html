@@ -165,6 +165,15 @@
                     </div>
                 </section>
 
+                <!-- Diagnostics -->
+                <section class="special-section">
+                    <h2>🧪 Diagnostics</h2>
+                    <div class="button-grid">
+                        <button class="btn btn-special" id="benchmarkBtn" title="Time the done signal: park at X10 Y10, move to X110 Y110, 10 runs each for 1-line and 10-line batches">Latency Test</button>
+                    </div>
+                    <pre id="benchmarkResult" class="benchmark-result" hidden></pre>
+                </section>
+
                 <!-- G-code History -->
                 <section class="history-section">
                     <h2>📝 G-code History</h2>
@@ -201,6 +210,11 @@
                             <button class="btn btn-secondary" id="saveFileBtn">Save File</button>
                             <button class="btn btn-primary" id="sendAllBtn">Print 3MF</button>
                             <button class="btn btn-primary" id="sendDirectBtn">Print Direct</button>
+                            <label class="editor-option" title="Send the whole G-code in one MQTT command instead of one command per line">
+                                <input type="checkbox" id="directSingleCall">
+                                <span>Single call</span>
+                            </label>
+                            <span id="directJobIndicator" class="job-indicator" hidden></span>
                             <button class="btn btn-secondary" id="download3mfBtn">Download 3MF</button>
                         </div>
                     </div>

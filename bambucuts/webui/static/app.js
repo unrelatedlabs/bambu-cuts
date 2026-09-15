@@ -10,6 +10,8 @@ let state = {
     printerIp: '',
     mqttProgress: null,
     directJob: null,
+    // Job id created by the last Print Direct click; the indicator follows it.
+    watchedDirectJobId: null,
     cameraStreaming: false,
     cameraAlive: false,
     cameraPollInterval: null,
@@ -136,6 +138,7 @@ function attachEventListeners() {
     document.getElementById('sendAllBtn').addEventListener('click', sendAllGcode);
     document.getElementById('sendDirectBtn').addEventListener('click', sendAllGcodeDirect);
     document.getElementById('download3mfBtn').addEventListener('click', download3mf);
+    document.getElementById('benchmarkBtn').addEventListener('click', runLatencyBenchmark);
 
     // Camera controls
     const cameraStartBtn = document.getElementById('cameraStartBtn');
@@ -749,6 +752,7 @@ async function updateStatus() {
         updatePositionDisplay(data.position);
         updateConnectionStatus(data.printer_connected, data.printer_ip, data.connection_error, data.printer_state, data.mqtt_progress, data.direct_job);
         updateCameraControls(data.camera_streaming, data.camera_alive, data.printer_connected);
+        updateDirectJobIndicator(data.direct_job);
     } catch (error) {
         console.error('Status update error:', error);
     }
@@ -815,10 +819,9 @@ function updateConnectionStatus(connected, printerIp, error, printerState, mqttP
                 statusMessage += ' - Direct queue error';
             } else if (directJob.status === 'stalled') {
                 statusMessage += ' - Direct stalled';
-            } else if (directJob.last_marker_index && directJob.logical_percent !== null && directJob.logical_percent !== undefined) {
-                statusMessage += ` - Direct ${directJob.logical_percent}% done`;
             } else if (directJob.active) {
-                statusMessage += ' - Direct waiting';
+                const est = directJob.estimated_seconds ? ` (~${Math.round(directJob.estimated_seconds)}s)` : '';
+                statusMessage += ` - Direct waiting${est}`;
             }
         }
         statusText.textContent = statusMessage;
@@ -1246,6 +1249,147 @@ async function sendAllGcode() {
     }
 }
 
+// Print Direct completion indicator: follows the job created by the last click.
+function updateDirectJobIndicator(job) {
+    const el = document.getElementById('directJobIndicator');
+    const btn = document.getElementById('sendDirectBtn');
+    if (!el) return;
+
+    if (!state.watchedDirectJobId || !job || job.id !== state.watchedDirectJobId) {
+        // A newer job superseded ours, or nothing is being watched.
+        if (state.watchedDirectJobId && job && job.id !== state.watchedDirectJobId) {
+            state.watchedDirectJobId = null;
+            el.hidden = true;
+            btn.disabled = false;
+        }
+        return;
+    }
+
+    el.hidden = false;
+    const startedAt = (job.queued_at || job.started_at || 0) * 1000;
+    const elapsed = startedAt ? Math.max(0, (Date.now() - startedAt) / 1000) : null;
+
+    if (job.active) {
+        const est = job.estimated_seconds ? ` / ~${Math.round(job.estimated_seconds)}s` : '';
+        const shown = elapsed !== null ? `${Math.round(elapsed)}s` : '';
+        el.className = 'job-indicator waiting';
+        el.textContent = job.status === 'queueing' ? '⏳ Queueing…' : `⏳ Printing… ${shown}${est}`;
+        el.title = job.message || '';
+        btn.disabled = true;
+        return;
+    }
+
+    btn.disabled = false;
+    if (job.status === 'complete') {
+        const took = job.completed_at && job.queued_at ? ` in ${(job.completed_at - job.queued_at).toFixed(1)}s` : '';
+        el.className = 'job-indicator done';
+        el.textContent = `✓ Done${took}`;
+        el.title = job.message || 'Printer reached the final M73 checkpoint';
+    } else if (job.status === 'stalled') {
+        el.className = 'job-indicator failed';
+        el.textContent = '✗ Stalled';
+        el.title = job.message || 'No done signal within the timeout';
+    } else if (job.status === 'queue_error') {
+        el.className = 'job-indicator failed';
+        el.textContent = '✗ Queue error';
+        el.title = (job.errors || []).join('; ') || job.message || '';
+    } else {
+        el.className = 'job-indicator';
+        el.textContent = job.status;
+        el.title = job.message || '';
+    }
+}
+
+// Done-signal latency benchmark
+async function runLatencyBenchmark() {
+    if (!state.printerConnected) {
+        showNotification('Printer not connected', 'warning');
+        return;
+    }
+
+    if (!confirm('Run latency test? The head moves between X10 Y10 and X110 Y110 twenty times. Lift the pen first.')) {
+        return;
+    }
+
+    const singleCallEl = document.getElementById('directSingleCall');
+    const singleCall = !!(singleCallEl && singleCallEl.checked);
+    const panel = document.getElementById('benchmarkResult');
+    const btn = document.getElementById('benchmarkBtn');
+
+    try {
+        const response = await fetch(`${API_BASE}/api/gcode/benchmark`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ iterations: 10, line_counts: [1, 10], single_call: singleCall })
+        });
+        const data = await response.json();
+        if (!data.success) {
+            showNotification(`Benchmark failed to start: ${data.error || 'Unknown error'}`, 'error');
+            return;
+        }
+    } catch (error) {
+        console.error('Benchmark start error:', error);
+        showNotification('Failed to start benchmark', 'error');
+        return;
+    }
+
+    btn.disabled = true;
+    panel.hidden = false;
+    panel.textContent = 'Latency test starting...';
+
+    const poll = async () => {
+        try {
+            const response = await fetch(`${API_BASE}/api/gcode/benchmark`);
+            const data = await response.json();
+            if (data.success) {
+                panel.textContent = formatBenchmarkReport(data.benchmark);
+                if (data.benchmark.status === 'running') {
+                    setTimeout(poll, 1000);
+                    return;
+                }
+                showNotification(`Latency test ${data.benchmark.status}`, data.benchmark.status === 'complete' ? 'success' : 'error');
+            }
+        } catch (error) {
+            console.error('Benchmark poll error:', error);
+            panel.textContent += '\nLost contact with server while polling.';
+        }
+        btn.disabled = false;
+    };
+    setTimeout(poll, 1000);
+}
+
+function formatBenchmarkReport(report) {
+    const fmt = (v) => (v === null || v === undefined) ? '-' : Number(v).toFixed(3);
+    const statLine = (label, s) => (s && s.count)
+        ? `  ${label.padEnd(9)} min ${fmt(s.min)}  med ${fmt(s.median)}  mean ${fmt(s.mean)}  max ${fmt(s.max)}  sd ${fmt(s.stdev)}  (n=${s.count})`
+        : `  ${label.padEnd(9)} -`;
+
+    const lines = [];
+    lines.push(`Latency test: ${report.status}  |  F${report.feed_mm_min}  |  ${report.single_call ? 'single call' : 'line by line'}  |  ${report.iterations} runs per case`);
+    if (report.error) {
+        lines.push(`Error: ${report.error}`);
+    }
+    for (const c of report.cases || []) {
+        const done = (c.runs || []).length;
+        const est = c.stats && c.stats.estimated_motion_seconds !== undefined && c.stats.estimated_motion_seconds !== null
+            ? c.stats.estimated_motion_seconds
+            : (c.runs && c.runs[0] ? c.runs[0].estimated_motion_seconds : null);
+        lines.push('');
+        lines.push(`${c.line_count}-line batch  (${done}/${report.iterations} runs, est. motion ${fmt(est)}s)`);
+        for (const r of c.runs || []) {
+            lines.push(`  run ${String(r.run).padStart(2)}: queue ${fmt(r.queue_seconds)}s  wait ${fmt(r.wait_seconds)}s  overhead ${fmt(r.overhead_seconds)}s  ${r.ok ? '' : 'FAILED: ' + (r.error || r.status)}`);
+        }
+        if (c.stats && c.stats.wait_seconds) {
+            lines.push('  stats (seconds):');
+            lines.push(statLine('queue', c.stats.queue_seconds));
+            lines.push(statLine('wait', c.stats.wait_seconds));
+            lines.push(statLine('overhead', c.stats.overhead_seconds));
+            lines.push(statLine('total', c.stats.total_seconds));
+        }
+    }
+    return lines.join('\n');
+}
+
 async function sendAllGcodeDirect() {
     const content = document.getElementById('gcodeEditor').value;
 
@@ -1259,24 +1403,43 @@ async function sendAllGcodeDirect() {
         return;
     }
 
-    if (!confirm('Send G-code directly line-by-line to printer?')) {
+    const singleCallEl = document.getElementById('directSingleCall');
+    const singleCall = !!(singleCallEl && singleCallEl.checked);
+
+    const confirmMessage = singleCall
+        ? 'Send all G-code to printer in one call?'
+        : 'Send G-code directly line-by-line to printer?';
+    if (!confirm(confirmMessage)) {
         return;
     }
 
     try {
-        showNotification('Sending G-code directly...', 'info');
+        showNotification(singleCall ? 'Sending G-code in one call...' : 'Sending G-code directly...', 'info');
+        const indicator = document.getElementById('directJobIndicator');
+        indicator.hidden = false;
+        indicator.className = 'job-indicator waiting';
+        indicator.textContent = '⏳ Queueing…';
+        indicator.title = '';
+        document.getElementById('sendDirectBtn').disabled = true;
 
         const response = await fetch(`${API_BASE}/api/gcode/send-all`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ gcode: content })
+            body: JSON.stringify({ gcode: content, single_call: singleCall })
         });
 
         const data = await response.json();
 
         if (data.success) {
-            const markerCount = data.progress && data.progress.marker_count ? data.progress.marker_count : 0;
-            showNotification(`Queued ${data.sent_count} G-code lines; waiting for ${markerCount} M73 checkpoints`, 'success');
+            if (data.job_id) {
+                state.watchedDirectJobId = data.job_id;
+                updateDirectJobIndicator(data.direct_job);
+            }
+            const est = data.progress && data.progress.estimated_seconds ? `, ~${Math.round(data.progress.estimated_seconds)}s` : '';
+            const how = data.single_call
+                ? ` in one call (${Math.round((data.payload_bytes || 0) / 1024)} KB)`
+                : '';
+            showNotification(`Queued ${data.sent_count} G-code lines${how}${est}; waiting for the final M73 checkpoint`, 'success');
             updateHistory();
             updateStatus();
         } else {
@@ -1284,10 +1447,19 @@ async function sendAllGcodeDirect() {
             if (data.errors && data.errors.length > 0) {
                 console.error('Errors:', data.errors);
             }
+            const el = document.getElementById('directJobIndicator');
+            el.className = 'job-indicator failed';
+            el.textContent = '✗ Send failed';
+            el.title = data.error || (data.errors || []).join('; ') || '';
+            document.getElementById('sendDirectBtn').disabled = false;
         }
     } catch (error) {
         console.error('Send direct error:', error);
         showNotification('Failed to send G-code', 'error');
+        const el = document.getElementById('directJobIndicator');
+        el.className = 'job-indicator failed';
+        el.textContent = '✗ Send failed';
+        document.getElementById('sendDirectBtn').disabled = false;
     }
 }
 
