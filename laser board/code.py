@@ -416,6 +416,15 @@ flag_byte = None
 ok_frames = 0
 crc_err = 0
 len_err = 0
+
+# Bytes seen while no frame is being accumulated, i.e. before any start byte.
+# On a quiet bus this should stay at zero: anything else means bytes are
+# arriving that never became a frame, which is what a destroyed start byte
+# looks like from here. Runs counts consecutive stretches of them, so one
+# mangled frame reads as one run rather than a dozen bytes.
+orphan_bytes = 0
+orphan_runs = 0
+in_orphan_run = False
 last_report = time.monotonic()
 
 
@@ -595,6 +604,7 @@ def tick():
 
     pass
 
+# Declared here because the main loop below assigns to them.
 while True:
     b = uart.read(100)
     servo_update()
@@ -605,6 +615,7 @@ while True:
              f"servo_gap={servo_max_gap_ns // 1_000_000}ms "
              f"marks={markers_sent}/{markers_dropped}/{len(out_backlog)} "
              f"fixed={repairs_ok}/{repairs_rejected} "
+             f"orphan={orphan_bytes}/{orphan_runs} "
              f"host={'up' if marker_port.connected else 'down'}\n")
         while bad_frames:
             why, raw = bad_frames.pop(0)
@@ -621,7 +632,12 @@ while True:
             # Waiting for start byte
             if val == START:
                 frame.append(val)
-            # else ignore
+                in_orphan_run = False
+            else:
+                orphan_bytes += 1
+                if not in_orphan_run:
+                    orphan_runs += 1
+                    in_orphan_run = True
             continue
 
         # We have started a frame; keep accumulating
