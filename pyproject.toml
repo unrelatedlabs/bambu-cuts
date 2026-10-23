@@ -32,6 +32,7 @@ dependencies = [
     "flask-cors>=3.0.0",
     "flask-socketio>=5.0.0",
     "paho-mqtt>=1.6.0",
+    "pyserial>=3.5",
     "bambulabs_api",
     "svgpathtools",
     "shapely",

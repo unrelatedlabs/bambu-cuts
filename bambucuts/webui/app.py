@@ -32,6 +32,7 @@ try:
     from bambucuts.gcodetools import GCodeTools, CuttingParameters
     from bambucuts.dxf2svg import convert_dxf_to_svg
     from bambucuts.head_tracker import HeadTracker, MotionState, simulate as simulate_gcode
+    from bambucuts.marker_link import MarkerLink
 except ImportError as e:
     print(f"Error importing required modules: {e}")
     print("Make sure bambulabs_api is installed and bambucuts is available")
@@ -102,6 +103,10 @@ camera_frame_lock = threading.Lock()
 latest_camera_frame = None
 latest_camera_frame_time = None
 
+# Completion markers from the laser board over USB serial. Set up by
+# start_marker_link(); None when the side channel is off or unavailable.
+marker_link = None
+
 # MQTT status monitor control
 mqtt_status_thread = None
 # Updated in place by the listener: 'pushall_count', 'last_pushall_at'.
@@ -111,14 +116,69 @@ mqtt_status_lock = threading.Lock()
 direct_job_lock = threading.Lock()
 
 
+def _handle_marker(address, value, at):
+    """Called from the marker reader thread for every marker the board sends.
+
+    Observe only for now: it logs when the marker arrived relative to the
+    oldest in-flight job, which is the measurement that says what the side
+    channel is worth against the 1-2s the MQTT progress report costs. Job
+    completion still runs off the MQTT marker.
+
+    Kept cheap on purpose: this runs on the reader thread, which must get
+    back to the port promptly, and work here delays the next marker.
+    """
+    with direct_job_lock:
+        active = _active_direct_jobs()
+        queued_at = active[0].get('queued_at') if active else None
+    since = f"+{at - queued_at:.3f}s after queue" if queued_at else "no job in flight"
+    print(f"Marker {value} on address {address}: {since}")
+
+
+def start_marker_link():
+    """Start reading completion markers from the laser board.
+
+    Independent of the printer connection: the board is a local USB device
+    and is worth watching even with the printer offline, since that is how
+    you tell whether the side channel is wired up at all.
+    """
+    global marker_link
+
+    cfg = config.get_config()
+    if not cfg.get('marker_enabled', True):
+        print("Marker side channel disabled in config; jobs will complete on MQTT only")
+        return False
+
+    if marker_link is None:
+        marker_link = MarkerLink(
+            device=cfg.get('marker_device') or None,
+            on_marker=_handle_marker,
+        )
+    return marker_link.start()
+
+
+def stop_marker_link():
+    if marker_link is not None:
+        marker_link.stop()
+
+
+def marker_link_status():
+    """Side channel status for the status endpoint, trimmed for a 1 Hz poll."""
+    if marker_link is None:
+        return {'enabled': False, 'connected': False, 'device': None,
+                'error': 'Marker side channel not started', 'marker_count': 0}
+    status = marker_link.status()
+    status.pop('log', None)
+    return status
+
+
 def connect_printer():
     """Connect to the BambuLab printer."""
     global printer, state
 
     try:
         # Get current config values
-        cfg = config._config_data
-        print(f"Connecting to printer at {cfg['ip']}...")
+        cfg = config.get_config()
+        print(f"Connecting to printer at {cfg['ip']} [{config.profile_label()}]...")
         printer = bl.Printer(cfg['ip'], cfg['access_code'], cfg['serial'])
         printer.connect()
         time.sleep(2)  # Allow time for connection to establish
@@ -126,8 +186,11 @@ def connect_printer():
         state['connection_error'] = None
         print("Successfully connected to printer")
 
-        # Set relative mode for jogging
-        set_relative_mode()
+        # Nothing is sent about positioning mode here: connecting is not a user
+        # action, and G90 is both the firmware's resting state and what this app
+        # leaves behind on disconnect, which is what the tracker starts from.
+        print(f"Assuming absolute positioning (G90), "
+              f"{'position unknown until you home or zero' if head.uncertain else 'position known'}")
 
         start_mqtt_status_monitor()
 
@@ -148,7 +211,9 @@ def disconnect_printer():
         stop_mqtt_status_monitor()
 
         if printer and state['printer_connected']:
-            # Restore absolute mode before disconnecting
+            # Leave the printer in absolute mode, which is what the next
+            # connect assumes without sending anything. Only a relative jog
+            # can have left it in G91, so this is usually a no-op.
             set_absolute_mode()
             printer.disconnect()
             print("Disconnected from printer")
@@ -554,34 +619,40 @@ def stop_camera_stream():
         latest_camera_frame_time = None
 
 
-def set_relative_mode():
-    """Set printer to relative positioning mode for jogging."""
-    head.apply("G91")
+def set_positioning_mode(absolute: bool) -> bool:
+    """Put the printer in G90/G91, skipping the send when it is already there.
+
+    The head tracker carries the modal state across sends, so the mode command
+    only goes out when the queued G-code would leave the printer in the other
+    mode, and never without the user asking for a move. Returns True when a
+    command was actually sent, which is also the only case worth waiting on.
+    """
+    gcode = "G90" if absolute else "G91"
+    if head.target_state().absolute is absolute:
+        return False
+
+    head.apply(gcode)
+    add_to_history(gcode)
     if not state['printer_connected'] or not printer:
         return False
 
     try:
-        printer.gcode("G91")
-        print("Set printer to relative mode (G91)")
+        printer.gcode(gcode)
+        print(f"Set printer to {'absolute' if absolute else 'relative'} mode ({gcode})")
         return True
     except Exception as e:
-        print(f"Failed to set relative mode: {e}")
+        print(f"Failed to set {'absolute' if absolute else 'relative'} mode: {e}")
         return False
 
 
-def set_absolute_mode():
+def set_relative_mode() -> bool:
+    """Set printer to relative positioning mode."""
+    return set_positioning_mode(False)
+
+
+def set_absolute_mode() -> bool:
     """Set printer to absolute positioning mode."""
-    head.apply("G90")
-    if not state['printer_connected'] or not printer:
-        return False
-
-    try:
-        printer.gcode("G90")
-        print("Set printer to absolute mode (G90)")
-        return True
-    except Exception as e:
-        print(f"Failed to set absolute mode: {e}")
-        return False
+    return set_positioning_mode(True)
 
 
 def send_gcode_to_printer(gcode: str) -> bool:
@@ -1007,8 +1078,12 @@ def _query_bool(name: str, default: bool = False) -> bool:
 
 @app.route('/')
 def index():
-    """Serve the main page."""
-    return render_template('index.html')
+    """Serve the main page. The instance name keeps several tabs apart."""
+    return render_template(
+        'index.html',
+        instance_name=config.display_name(),
+        is_default_profile=config.get_profile() is None,
+    )
 
 
 @app.route('/api/status', methods=['GET'])
@@ -1037,10 +1112,13 @@ def get_status():
         'step_size': state['step_size'],
         'printer_connected': state['printer_connected'],
         'connection_error': state['connection_error'],
-        'printer_ip': config._config_data.get('ip', ''),
+        'printer_ip': config.get_config().get('ip', ''),
+        'profile': config.profile_label(),
+        'printer_name': config.display_name(),
         'printer_state': printer_state,
         'mqtt_progress': mqtt_progress,
         'mqtt_status': mqtt_status,
+        'marker_link': marker_link_status(),
         'direct_job': direct_job,
         'camera_streaming': state['camera_streaming'],
         'camera_alive': camera_alive
@@ -1149,7 +1227,14 @@ def toggle_connection():
 
 @app.route('/api/move', methods=['POST'])
 def move_axis():
-    """Move specified axis by distance."""
+    """Jog an axis by `distance` mm.
+
+    The move goes out absolute, to where the tracker says the head will be
+    plus the step, so the printer stays in G90 and a jog cannot drift away
+    from what we think the position is. Two cases still jog relative: a
+    position we do not know yet (nothing homed or zeroed, or a job left it
+    uncertain), and E, which this rig extrudes relative.
+    """
     data = request.json
     axis = data.get('axis', '').lower()
     distance = float(data.get('distance', 0))
@@ -1157,17 +1242,28 @@ def move_axis():
     if axis not in ['x', 'y', 'z', 'e']:
         return jsonify({'success': False, 'error': 'Invalid axis'}), 400
 
-    gcode_relative = "G91"
-    gcode_move = f"G1 {axis.upper()}{distance:.3f} F{state['feed_rate']:.0f}"
-    add_to_history(gcode_relative)
-    add_to_history(gcode_move)
+    target = head.target_state()
+    relative = axis == 'e' or head.uncertain
+    value = distance if relative else getattr(target, axis) + distance
 
-    success = send_tracked(gcode_relative) and send_tracked(gcode_move)
+    # Only switch mode when this jog needs the other one.
+    sent = []
+    success = True
+    if target.absolute is relative:
+        mode = "G91" if relative else "G90"
+        sent.append(mode)
+        add_to_history(mode)
+        success = send_tracked(mode)
+
+    gcode_move = f"G1 {axis.upper()}{value:.3f} F{state['feed_rate']:.0f}"
+    sent.append(gcode_move)
+    add_to_history(gcode_move)
+    success = success and send_tracked(gcode_move)
 
     return jsonify({
         'success': success,
         'position': head.position,
-        'gcode': [gcode_relative, gcode_move]
+        'gcode': sent
     })
 
 
@@ -1179,18 +1275,15 @@ def home_axes():
     if not axes:
         return jsonify({'success': False, 'error': 'axes must be some of X, Y, Z'}), 400
 
-    # For homing, temporarily switch to absolute mode
-    set_absolute_mode()
-    if state['printer_connected']:
+    # Home in absolute mode. Nothing is sent unless a relative jog left the
+    # printer in G91, and it stays absolute afterwards.
+    if set_absolute_mode():
         time.sleep(0.1)
 
     gcode = "G28 " + " ".join(axes)
     add_to_history(gcode)
 
     success = send_tracked(gcode)
-    if state['printer_connected']:
-        time.sleep(0.1)
-    set_relative_mode()
 
     return jsonify({
         'success': success,
@@ -1285,18 +1378,15 @@ def move_z_absolute():
     data = request.json
     z_position = float(data.get('position', 0))
 
-    # Switch to absolute mode
-    set_absolute_mode()
-    if state['printer_connected']:
+    # Absolute Z move; nothing is sent unless a relative jog left the printer
+    # in G91, and it stays absolute afterwards.
+    if set_absolute_mode():
         time.sleep(0.1)
 
     gcode = f"G1 Z{z_position:.1f} F600"
     add_to_history(gcode)
 
     success = send_tracked(gcode)
-    if state['printer_connected']:
-        time.sleep(0.1)
-    set_relative_mode()
 
     return jsonify({
         'success': success,
@@ -1353,10 +1443,14 @@ def set_step_size():
 @app.route('/api/config', methods=['GET'])
 def get_config():
     """Get current configuration."""
+    cfg = config.get_config()
     return jsonify({
-        'ip': config._config_data.get('ip', ''),
-        'serial': config._config_data.get('serial', ''),
-        'access_code': config._config_data.get('access_code', '')
+        'ip': cfg.get('ip', ''),
+        'serial': cfg.get('serial', ''),
+        'access_code': cfg.get('access_code', ''),
+        'name': cfg.get('name', ''),
+        'profile': config.profile_label(),
+        'config_file': str(config.config_path())
     })
 
 
@@ -1372,11 +1466,12 @@ def save_config_endpoint():
     success, message = config.update_config(
         ip=data.get('ip'),
         serial=data.get('serial'),
-        access_code=data.get('access_code')
+        access_code=data.get('access_code'),
+        name=data.get('name')
     )
 
     if success:
-        print(f"Config saved. Current config: {config._config_data}")
+        print(f"Config saved [{config.profile_label()}]: {config.get_config()}")
 
         # Clear printer object and state completely
         printer = None
@@ -2462,24 +2557,48 @@ def handle_frame_request():
             print(f"Error getting camera frame: {e}")
 
 
-def start_server(host='0.0.0.0', port=5425, debug=False):
-    """Start the Bambu Cuts web server."""
+def start_server(host='0.0.0.0', port=None, debug=False):
+    """Start the Bambu Cuts web server (port defaults to the profile's own)."""
+    port = int(port or config.default_port())
     print("Starting Bambu Cuts - Cutter and Plotter API...")
-    print(f"Printer IP: {config._config_data.get('ip', 'Not configured')}")
+    print(f"Profile: {config.profile_label()}  ({config.config_path()})")
+    print(f"Printer IP: {config.get_config().get('ip', 'Not configured')}")
     print(f"Server will run at: http://{host}:{port}")
     print()
 
     # Auto-connect on startup
     print("Attempting to connect to printer on startup...")
     connect_printer()
+    start_marker_link()
 
     try:
         socketio.run(app, host=host, port=port, debug=debug, use_reloader=False, allow_unsafe_werkzeug=True)
     finally:
         # Clean up
         stop_camera_stream()
+        stop_marker_link()
         disconnect_printer()
 
 
 if __name__ == '__main__':
-    start_server(debug=True)
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Bambu Cuts web server')
+    parser.add_argument('--profile', default=None,
+                        help='Printer profile to use (default: $BAMBUCUTS_PROFILE or the default profile)')
+    parser.add_argument('--host', default=None, help='Host to bind to (default: 0.0.0.0)')
+    parser.add_argument('--port', type=int, default=None,
+                        help="Port to bind to (default: the profile's 'port', else 5425 for the "
+                             "default profile and one port up per extra profile)")
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    args = parser.parse_args()
+
+    if args.profile is not None:
+        config.set_profile(args.profile)
+
+    cfg = config.get_config()
+    host = args.host or os.environ.get('BAMBUCUTS_HOST') or cfg.get('host') or '0.0.0.0'
+    port = args.port or int(os.environ.get('BAMBUCUTS_PORT') or cfg.get('port')
+                           or config.default_port())
+
+    start_server(host=host, port=port, debug=args.debug)

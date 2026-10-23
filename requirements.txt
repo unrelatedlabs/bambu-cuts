@@ -4,6 +4,9 @@ flask>=2.0.0
 flask-cors>=3.0.0
 flask-socketio>=5.0.0
 paho-mqtt>=1.6.0
+# Reads completion markers from the laser board over USB serial; the app
+# runs without it and falls back to MQTT-only job completion.
+pyserial>=3.5
 svgpathtools
 shapely
 ezdxf

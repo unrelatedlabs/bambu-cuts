@@ -1,4 +1,3 @@
-# boot.py
 """
 Wemos ESP32 S2 Mini board
 
@@ -14,6 +13,10 @@ GPIO 6 and 7  = LED + on 7, - on 6. Follow light outout
 GPIP 39 = PWM output for laser power.
 
 GPIO 33 = Servo signal (50 Hz PWM). Controlled with M620 R{angle}, angle 0-180.
+
+Values 0-200 set laser power (P) or servo angle (R). Values from MARKER_MIN
+up are completion markers for the host instead, and never touch the outputs:
+see report_marker() below.
 
 I used 2 DC/DC buck converters to get 12V and 5V from the 24V input from the printer.
 
@@ -37,6 +40,12 @@ import time
 import digitalio
 import microcontroller
 import pwmio
+import usb_cdc
+
+# Per-frame tracing on the console. Off by default: the UART loop reads at
+# 1.2 Mbaud and the servo needs a pulse every 20 ms, so three print() calls
+# per decoded frame are enough to cost frames and jitter the servo.
+DEBUG = False
 
 # Try board.LED first; if it doesn't exist, manually set GPIO15
 
@@ -118,6 +127,55 @@ def servo_update():
     eased = t * t * (3.0 - 2.0 * t)   # smoothstep: ease in, ease out
     servo_angle = servo_from + (servo_to - servo_from) * eased
     servo_write(servo_angle)
+
+
+# ===== Completion markers back to the host =====
+# Values 0-200 are real laser power or servo angle. From MARKER_MIN up they
+# are completion markers sent by bambucuts, which appends one `M620 R<code>`
+# to a batch of G-code and waits to see it arrive here. This board decodes
+# the AMS-Lite frame within a millisecond of the printer executing the
+# command, where the printer's own MQTT progress report lags an executed M73
+# by 1-2 seconds, so the marker confirms the batch far sooner.
+#
+# The marker range is checked before the address is dispatched, so a marker
+# never reaches set_servo() or set_power(). That matters: set_servo() clamps
+# to 180, so an unintercepted marker would park the servo at full deflection.
+MARKER_MIN = 201
+
+# Prefer the dedicated data port from boot.py, so markers do not share the
+# console with debug output and a terminal on the REPL cannot eat them.
+marker_port = usb_cdc.data          # None unless boot.py enabled it
+if marker_port is not None:
+    # Never block the UART loop waiting for the host to drain the buffer.
+    marker_port.timeout = 0
+    marker_port.write_timeout = 0
+
+markers_sent = 0
+markers_dropped = 0
+
+
+def report_marker(address, value):
+    """Send one marker line to the host, without ever blocking.
+
+    Dropping a marker is safe: the host also appends an M73 fallback and
+    completes the job off whichever arrives first, so a full buffer or a
+    closed port costs latency, not correctness.
+    """
+    global markers_sent, markers_dropped
+    line = "MARK %d %d %d\n" % (address, value, time.monotonic_ns() // 1000000)
+    if marker_port is None:
+        # No data port: the console is all we have.
+        print(line, end="")
+        markers_sent += 1
+        return
+    if not marker_port.connected:
+        markers_dropped += 1
+        return
+    try:
+        marker_port.write(line.encode("ascii"))
+        markers_sent += 1
+    except OSError:
+        markers_dropped += 1
 
 
 
@@ -237,17 +295,29 @@ def finish_if_complete():
 last_power_countdown = 0
 
 def set_power(power):
-    pwm.duty_cycle = int(power * 0xFFFF // 200);
-    pwmLed.duty_cycle = int(power * 0xFFFF // 200);
+    # Clamp: duty_cycle is 16-bit, so an unclamped power above 200 overflows
+    # it and raises ValueError instead of setting anything.
+    power = max(0, min(200, power))
+    duty = int(power * 0xFFFF // 200)
+    pwm.duty_cycle = duty
+    pwmLed.duty_cycle = duty
 
 def process_packet(payload):
     global last_power_countdown
     try:
-        print("Payload",payload.hex(' '));
+        if DEBUG:
+            print("Payload",payload.hex(' '));
         value = payload[0] * 4 + payload[1]
         address = payload[2]
 
-        print(f"a={address}, v={value}")
+        if DEBUG:
+            print(f"a={address}, v={value}")
+
+        if value >= MARKER_MIN:
+            # A host completion marker, not a power or angle. Report it and
+            # leave the laser and servo exactly as they are.
+            report_marker(address, value)
+            return
 
         if address == 0:
             set_power(value)
@@ -303,7 +373,7 @@ def process_frame(buf: bytearray) -> bool:
         tgt = (buf[7] << 8) | buf[8]
         src = (buf[9] << 8) | buf[10]
         payload = bytes(buf[11:L - 2])
-        if payload.hex(" ") not in ["03 01 fe","03 01 ff"]:
+        if DEBUG and payload.hex(" ") not in ["03 01 fe","03 01 ff"]:
             print(f"[LONG] seq={seq} src=0x{src:04X}->dst=0x{tgt:04X} len={L} payload={payload.hex(' ')}")
 
         return True
@@ -334,7 +404,8 @@ def process_frame(buf: bytearray) -> bool:
 
         pkt_type = buf[4]
         payload = bytes(buf[5:L - 2])
-        print(f"[SHORT] type=0x{pkt_type:02X} len={L} payload={payload.hex(' ')}")
+        if DEBUG:
+            print(f"[SHORT] type=0x{pkt_type:02X} len={L} payload={payload.hex(' ')}")
         process_packet(payload)
         return True
 
@@ -360,7 +431,10 @@ while True:
     servo_update()
     now = time.monotonic()
     if now - last_report >= 1:
-        print(f"[status] ok={ok_frames} crc_err={crc_err} len_err={len_err} buf={len(frame)} servo_gap={servo_max_gap_ns // 1_000_000}ms")
+        print(f"[status] ok={ok_frames} crc_err={crc_err} len_err={len_err} buf={len(frame)} "
+              f"servo_gap={servo_max_gap_ns // 1_000_000}ms "
+              f"marks={markers_sent}/{markers_dropped} "
+              f"host={'up' if marker_port is None or marker_port.connected else 'down'}")
         servo_max_gap_ns = 0
         last_report = now
         tick()
