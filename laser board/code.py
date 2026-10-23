@@ -1,22 +1,24 @@
 # boot.py
 """
-Wemos ESP32 S2 Mini board 
+Wemos ESP32 S2 Mini board
 
 https://www.wemos.cc/en/latest/s2/s2_mini.html
 
 GPIO
- 
-GPIO 1  = Uart RX. TOP RIGH AMS Lite PIN. Tx+ on the AMS Lite port on A1 mini 
-GPIO 2  = pull up, connect 510ohm resitor to GPIO1 
 
-GPIO 6 and 7  = LED + on 7, - on 6. Follow light outout 
+GPIO 1  = Uart RX. TOP RIGH AMS Lite PIN. Tx+ on the AMS Lite port on A1 mini
+GPIO 2  = pull up, connect 510ohm resitor to GPIO1
+
+GPIO 6 and 7  = LED + on 7, - on 6. Follow light outout
 
 GPIP 39 = PWM output for laser power.
+
+GPIO 33 = Servo signal (50 Hz PWM). Controlled with M620 R{angle}, angle 0-180.
 
 I used 2 DC/DC buck converters to get 12V and 5V from the 24V input from the printer.
 
 
-AMS Lite pin out 
+AMS Lite pin out
 
 
       +-------------------+
@@ -55,6 +57,68 @@ pwmLed = pwmio.PWMOut(
     duty_cycle=0      # Start at 0% duty
 )
 
+# ===== Servo on GPIO33 (standard hobby servo, 50 Hz) =====
+SERVO_FREQ = 50            # 20 ms period
+SERVO_MIN_US = 500         # pulse width at 0 degrees
+SERVO_MAX_US = 2500        # pulse width at 180 degrees
+SERVO_MAX_ANGLE = 180
+SERVO_MOVE_TIME = 0.33      # seconds for a full move, eased in and out
+SERVO_MOVE_NS = int(SERVO_MOVE_TIME * 1_000_000_000)
+
+servo = pwmio.PWMOut(
+    microcontroller.pin.GPIO33,
+    frequency=SERVO_FREQ,
+    duty_cycle=0      # no pulses until the first M620 R command
+)
+
+# Easing state: the command sets a target, servo_update() moves toward it
+servo_angle = None         # current angle; None until the first command
+servo_from = 0.0
+servo_to = 0.0
+servo_move_start = 0       # time.monotonic_ns() when the move began
+servo_moving = False
+# Diagnostics: longest gap between servo_update() calls, printed in [status]
+servo_last_update_ns = 0
+servo_max_gap_ns = 0
+
+def servo_write(angle):
+    pulse_us = SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * angle / SERVO_MAX_ANGLE
+    period_us = 1000000 / SERVO_FREQ
+    servo.duty_cycle = int(pulse_us * 0xFFFF / period_us)
+
+def set_servo(angle):
+    """Start an eased move to angle. The first command jumps directly."""
+    global servo_angle, servo_from, servo_to, servo_move_start, servo_moving
+    angle = max(0, min(SERVO_MAX_ANGLE, angle))
+    if servo_angle is None:
+        servo_angle = float(angle)
+        servo_write(servo_angle)
+        return
+    servo_from = servo_angle
+    servo_to = float(angle)
+    servo_move_start = time.monotonic_ns()
+    servo_moving = True
+
+def servo_update():
+    """Advance the current move. Must be called at least every 20 ms (one
+    servo pulse); the servo only samples one target per pulse."""
+    global servo_angle, servo_moving, servo_last_update_ns, servo_max_gap_ns
+    now_ns = time.monotonic_ns()
+    if servo_last_update_ns:
+        gap = now_ns - servo_last_update_ns
+        if gap > servo_max_gap_ns:
+            servo_max_gap_ns = gap
+    servo_last_update_ns = now_ns
+    if not servo_moving:
+        return
+    t = (now_ns - servo_move_start) / SERVO_MOVE_NS
+    if t >= 1.0:
+        t = 1.0
+        servo_moving = False
+    eased = t * t * (3.0 - 2.0 * t)   # smoothstep: ease in, ease out
+    servo_angle = servo_from + (servo_to - servo_from) * eased
+    servo_write(servo_angle)
+
 
 
 
@@ -64,7 +128,7 @@ led2a.direction = digitalio.Direction.OUTPUT
 
 led2a.value=0
 
-led.value = 1 
+led.value = 1
 
 
 pullup = digitalio.DigitalInOut(microcontroller.pin.GPIO2)
@@ -139,7 +203,7 @@ ok_frames = 0
 crc_err = 0
 len_err = 0
 last_report = time.monotonic()
- 
+
 
 def reset():
     global frame, expected_len, flag_byte
@@ -156,6 +220,7 @@ def finish_if_complete():
         if process_frame(frame):
             ok_frames += 1
         reset()
+        servo_update()   # keep the servo fed while a burst of frames is parsed
         return True
     elif expected_len and len(frame) > expected_len:
         print("Bad frame", frame.hex())
@@ -174,36 +239,38 @@ last_power_countdown = 0
 def set_power(power):
     pwm.duty_cycle = int(power * 0xFFFF // 200);
     pwmLed.duty_cycle = int(power * 0xFFFF // 200);
-    
+
 def process_packet(payload):
     global last_power_countdown
     try:
         print("Payload",payload.hex(' '));
         value = payload[0] * 4 + payload[1]
         address = payload[2]
-        
+
         print(f"a={address}, v={value}")
-        
+
         if address == 0:
             set_power(value)
             last_power_countdown = 60
-            
-    except e:
+        elif address == 1:
+            set_servo(value)
+
+    except Exception as e:
         print(e)
-        
-        
-    
+
+
+
 def process_frame(buf: bytearray) -> bool:
     """Validate and print a decoded frame. Returns True if valid."""
     global crc_err, len_err
     if len(buf) < 4:
         len_err += 1
         return False
-        
+
     if buf.hex() in KNOWN:
         #print("ping")
-        return True 
-        
+        return True
+
     #print(f"frame {len(buf)}", buf[:100].hex())
 
     flag = buf[1]
@@ -238,7 +305,7 @@ def process_frame(buf: bytearray) -> bool:
         payload = bytes(buf[11:L - 2])
         if payload.hex(" ") not in ["03 01 fe","03 01 ff"]:
             print(f"[LONG] seq={seq} src=0x{src:04X}->dst=0x{tgt:04X} len={L} payload={payload.hex(' ')}")
-            
+
         return True
 
     # ---------- Short header ----------
@@ -277,28 +344,30 @@ reset()
 print("Hello")
 ticks = 0
 def tick():
-    global ticks 
+    global ticks
     global last_power_countdown
     ticks += 1
     led.value = (ticks & 1) == 0
-    if last_power_countdown > 0: 
-        last_power_countdown -=1 
+    if last_power_countdown > 0:
+        last_power_countdown -=1
         if last_power_countdown == 0:
             set_power(0)
-            
-    pass 
-    
+
+    pass
+
 while True:
     b = uart.read(100)
+    servo_update()
     now = time.monotonic()
     if now - last_report >= 1:
-        print(f"[status] ok={ok_frames} crc_err={crc_err} len_err={len_err} buf={len(frame)}")
+        print(f"[status] ok={ok_frames} crc_err={crc_err} len_err={len_err} buf={len(frame)} servo_gap={servo_max_gap_ns // 1_000_000}ms")
+        servo_max_gap_ns = 0
         last_report = now
         tick()
-    
+
     if not b:
-        continue 
-        
+        continue
+
     for val in b:
         if not frame:
             # Waiting for start byte
