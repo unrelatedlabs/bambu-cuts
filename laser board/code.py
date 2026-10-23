@@ -314,6 +314,66 @@ def crc16_ccitt_0x1021(data: bytes, init: int = 0x913D) -> int:
                 crc = (crc << 1) & 0xFFFF
     return crc & 0xFFFF  # transmitted little-endian (low byte first)
 
+# ===== Single-bit repair of corrupted frames =====
+# Every corrupted bit measured on this link is 0 -> 1 and almost all frames
+# fail by exactly one bit, so most are recoverable. CRC16 is linear: flipping
+# the bit d places from the end of the CRC region always changes the CRC by
+# the same amount, so one table maps that difference back to d and a repair
+# costs one extra CRC pass instead of a search.
+#
+# Each entry is the previous one advanced a single CRC step, because shifting
+# the error pattern one bit multiplies it by x modulo the polynomial.
+REPAIR_FRAMES = True
+REPAIR_MAX_BITS = 8 * 40
+
+# A repaired frame is only ever accepted when it decodes into the marker
+# range. Searching until some candidate passes CRC is a good way to
+# manufacture a plausible wrong value, and a wrong laser power is a safety
+# problem where a wrong done marker is not: the host's timestamp guard
+# rejects a stale marker, and a spurious one at worst completes a job early.
+repairs_ok = 0
+repairs_rejected = 0
+
+
+def build_syndrome_table(maxbits=REPAIR_MAX_BITS):
+    table = {}
+    msg = bytearray(1)
+    base = crc16_ccitt_0x1021(msg)
+    msg[0] ^= 1
+    syn = crc16_ccitt_0x1021(msg) ^ base
+    for d in range(maxbits):
+        if d:
+            syn = ((syn << 1) ^ 0x1021) & 0xFFFF if syn & 0x8000 else (syn << 1) & 0xFFFF
+        table[syn] = d
+    return table
+
+
+SYNDROME = build_syndrome_table() if REPAIR_FRAMES else {}
+
+
+def repair_frame(buf, L, crc_calc, crc_seen):
+    """Return a repaired copy if one flipped bit explains the CRC failure.
+
+    Only frames decoding into the marker range are returned; anything else
+    is left to fail, which is what keeps this away from laser power.
+    """
+    global repairs_ok, repairs_rejected
+    d = SYNDROME.get(crc_calc ^ crc_seen)
+    region_len = L - 2
+    if d is None or d >= 8 * region_len:
+        return None
+    out = bytearray(buf)
+    out[region_len - 1 - (d >> 3)] ^= 1 << (d & 7)
+    if crc16_ccitt_0x1021(bytes(out[0:region_len])) != (out[L - 2] | (out[L - 1] << 8)):
+        return None
+    payload = bytes(out[5:region_len])
+    if len(payload) < 3 or payload[0] * 4 + payload[1] < MARKER_MIN:
+        repairs_rejected += 1
+        return None
+    repairs_ok += 1
+    return out
+
+
 # ===== UART Setup =====
 
 rx_pin = microcontroller.pin.GPIO1
@@ -499,10 +559,13 @@ def process_frame(buf: bytearray) -> bool:
         crc_calc = crc16_ccitt_0x1021(crc_region)
         crc_seen = buf[L - 2] | (buf[L - 1] << 8)
         if crc_calc != crc_seen:
-            crc_err += 1
-            keep_bad_frame(buf, "crc16-short")
-            print(f"Bad CRC16 (short) {crc_calc} != {crc_seen}")
-            return False
+            repaired = repair_frame(buf, L, crc_calc, crc_seen) if REPAIR_FRAMES else None
+            if repaired is None:
+                crc_err += 1
+                keep_bad_frame(buf, "crc16-short")
+                print(f"Bad CRC16 (short) {crc_calc} != {crc_seen}")
+                return False
+            buf = repaired
 
         pkt_type = buf[4]
         payload = bytes(buf[5:L - 2])
@@ -537,6 +600,7 @@ while True:
         emit(f"[status] ok={ok_frames} crc_err={crc_err} len_err={len_err} buf={len(frame)} "
              f"servo_gap={servo_max_gap_ns // 1_000_000}ms "
              f"marks={markers_sent}/{markers_dropped}/{len(out_backlog)} "
+             f"fixed={repairs_ok}/{repairs_rejected} "
              f"host={'up' if marker_port.connected else 'down'}\n")
         while bad_frames:
             why, raw = bad_frames.pop(0)

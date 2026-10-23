@@ -175,5 +175,48 @@ check("marker delivered once the console frees up",
       marks() and marks()[0].startswith("MARK 1 213"), repr(marks()))
 clear()
 
+print("\nsingle-bit frame repair")
+crc8_, crc16_ = ns["crc8_0x39"], ns["crc16_ccitt_0x1021"]
+process_frame, SYN = ns["process_frame"], ns["SYNDROME"]
+
+def build_frame(value, address):
+    """A well-formed short frame carrying this command."""
+    payload = bytes([value // 4, value % 4, address, 0, 0, 0])
+    L = 5 + len(payload) + 2
+    buf = bytearray([0x3D, 0xC5, L, 0, 0x07]) + payload + b"\x00\x00"
+    buf[3] = crc8_(bytes(buf[0:3]))
+    c = crc16_(bytes(buf[0:L - 2]))
+    buf[L - 2], buf[L - 1] = c & 0xFF, (c >> 8) & 0xFF
+    return buf
+
+check("syndrome table has no collisions",
+      len(SYN) == ns["REPAIR_MAX_BITS"], f"{len(SYN)} of {ns['REPAIR_MAX_BITS']}")
+
+good = build_frame(230, 1)
+check("a clean frame validates", process_frame(bytearray(good)))
+
+clear()
+corrupt = bytearray(good); corrupt[7] ^= 0x04          # one flipped bit in payload
+before = ns["repairs_ok"]
+ok = process_frame(corrupt)
+check("one-bit corrupted marker frame is repaired", ok and ns["repairs_ok"] == before + 1,
+      f"ok={ok} repairs={ns['repairs_ok']}")
+check("and its marker is emitted", marks() and marks()[0].startswith("MARK 1 230"), repr(marks()))
+
+clear()
+two = bytearray(good); two[7] ^= 0x04; two[9] ^= 0x10   # two flipped bits
+check("two-bit corruption is not repaired", not process_frame(two))
+
+clear()
+laser = build_frame(150, 0)                             # a real laser power command
+bad_laser = bytearray(laser); bad_laser[7] ^= 0x08
+before_rej = ns["repairs_rejected"]
+check("corrupted laser power is NOT repaired", not process_frame(bad_laser))
+check("and the rejection is counted", ns["repairs_rejected"] == before_rej + 1,
+      str(ns["repairs_rejected"]))
+check("laser untouched by a rejected repair", pwm.duty_cycle == pwm_before,
+      f"{pwm_before} -> {pwm.duty_cycle}")
+
+clear()
 print("\n" + ("FAILURES: " + ", ".join(fail) if fail else "all firmware checks passed"))
 sys.exit(1 if fail else 0)
