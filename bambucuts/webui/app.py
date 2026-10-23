@@ -13,6 +13,7 @@ from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 from werkzeug.utils import secure_filename
 import json
+import re
 import time
 import sys
 import os
@@ -717,6 +718,78 @@ def add_to_history(gcode: str):
         state['gcode_history'].pop(0)
 
 
+# ---------------------------------------------------------------------------
+# Tool control: standard G-code in, laser board protocol out.
+#
+# CAM tools emit M3/M4/M5 for a laser and M280 for a servo; the laser board
+# only understands M620/M621 on the AMS-Lite bus. Translating here means
+# LightBurn, Kiri:Moto and anything else can emit ordinary G-code and stay
+# unaware of this rig, rather than every post-processor needing a custom
+# profile.
+#
+#   M3 S<power> / M4 S<power>  ->  M620 P<v> M621 P<v>
+#   M5                         ->  M620 P0 M621 P0
+#   M280 P<index> S<angle>     ->  M620 R<angle> M621 R<angle>
+#
+# S is scaled from the tool's range (LASER_S_MAX, 1000 in LightBurn and
+# GRBL by default) onto the board's 0-200. An S already within 0-200 with
+# LASER_S_MAX left at 200 passes through unchanged.
+LASER_MAX_POWER = 200
+SERVO_MAX_ANGLE = 180
+LASER_S_MAX_DEFAULT = 1000
+
+_WORD = {}
+
+
+def _gcode_word(line: str, letter: str):
+    """Value of a G-code word such as S or P, or None when absent."""
+    pattern = _WORD.get(letter)
+    if pattern is None:
+        pattern = _WORD[letter] = re.compile(rf'(?:^|\s){letter}(-?\d+(?:\.\d+)?)', re.I)
+    match = pattern.search(line)
+    return float(match.group(1)) if match else None
+
+
+def _bus_command(channel: str, value: int) -> str:
+    """One laser-board command. M621 mirrors M620, as the board's docs show."""
+    return f"M620 {channel}{value} M621 {channel}{value}"
+
+
+def translate_tool_gcode(gcode_text: str, s_max: float = None):
+    """Rewrite M3/M4/M5 and M280 into the laser board's M620/M621 commands.
+
+    Lines that are not tool commands pass through untouched, including any
+    M620 the caller wrote itself. Returns (text, counts).
+    """
+    s_max = float(s_max or LASER_S_MAX_DEFAULT)
+    counts = {'laser': 0, 'servo': 0}
+    out = []
+    for raw in gcode_text.split('\n'):
+        code = strip_inline_comment(raw)
+        head = code.split(' ', 1)[0].upper() if code else ''
+        if head in ('M3', 'M03', 'M4', 'M04'):
+            s = _gcode_word(code, 'S')
+            # A bare M3 with no S means full power, as in GRBL.
+            power = LASER_MAX_POWER if s is None else s / s_max * LASER_MAX_POWER
+            power = max(0, min(LASER_MAX_POWER, int(round(power))))
+            out.append(f"{_bus_command('P', power)} ; {code}")
+            counts['laser'] += 1
+        elif head in ('M5', 'M05'):
+            out.append(f"{_bus_command('P', 0)} ; {code}")
+            counts['laser'] += 1
+        elif head == 'M280':
+            angle = _gcode_word(code, 'S')
+            if angle is None:
+                out.append(raw)       # nothing to act on; leave it alone
+                continue
+            angle = max(0, min(SERVO_MAX_ANGLE, int(round(angle))))
+            out.append(f"{_bus_command('R', angle)} ; {code}")
+            counts['servo'] += 1
+        else:
+            out.append(raw)
+    return '\n'.join(out), counts
+
+
 def strip_inline_comment(line: str) -> str:
     """Return the executable portion of a G-code line."""
     return line.split(';', 1)[0].strip()
@@ -772,16 +845,18 @@ MARKER_FIELD = 'mc_percent'
 SIDE_MARKER_MIN = 201
 SIDE_MARKER_MAX = 251
 
-# How many consecutive codes each batch sends. The tap off the AMS-Lite pair
-# is single-ended and loses about 1.7% of frames to bit errors, so one marker
-# is not enough; two different codes give two independent chances and
-# measured 0 of 60 batches with no marker against 2 of 60 for a single one.
+# How many codes each batch sends. One, because redundancy here is not
+# achievable: the printer coalesces a gcode_line payload and emits a single
+# bus frame carrying only the final value of the channel, whatever is put in
+# it. Measured over 30 trials per size, the marker that arrives is the LAST
+# of the block every time (30/30 at size 2), repeated and sentinel-separated
+# copies both yield a mean of 1.00 frames, and 1000 round-robin batches show
+# no latency difference and no reliable loss difference between 1 and 5.
 #
-# They must differ: the printer collapses repeated identical `M620 R<n>` and
-# emits one frame however many times it is sent, so repeating a code buys
-# nothing. Consecutive codes cost about 100ms of latency once (51ms -> 155ms
-# median) and nothing further beyond two, which is why this is 2 and not more.
-SIDE_MARKER_REPEATS = 2
+# Splitting a block across separate publishes does produce an occasional
+# second frame, but costs ~100ms per publish and measured worse overall.
+# Loss is handled by the MQTT fallback instead; see inject_mqtt_fallback().
+SIDE_MARKER_REPEATS = 1
 
 # How long past a job's estimated run time to wait for its side-channel
 # marker before injecting the MQTT fallback. Injecting early is harmless:
@@ -1852,6 +1927,14 @@ def queue_direct_gcode(gcode_text: str, single_call: bool = False, progress_mark
         'estimated_seconds': round(estimate_gcode_seconds(gcode_text), 1),
         'timeout_seconds': 0.0,
     }
+    # Tool commands become laser board commands before anything else looks
+    # at the G-code, so history, the head tracker and the done markers all
+    # see what is actually sent.
+    gcode_text, tool_counts = translate_tool_gcode(gcode_text)
+    if tool_counts['laser'] or tool_counts['servo']:
+        print(f"Translated {tool_counts['laser']} laser and {tool_counts['servo']} "
+              f"servo command(s) into laser board commands")
+
     gcode_to_send = gcode_text
     if progress_markers:
         gcode_to_send, progress_info = add_completion_marker(gcode_text, wait_for_motion=wait_for_motion)

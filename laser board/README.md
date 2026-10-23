@@ -88,6 +88,18 @@ Also issue M400 before turning on/off to complete the move
 
 Angle range is 0-180. Moves are eased in and out over 0.33 s.
 
+## Standard G-code
+
+You do not have to write the bus commands yourself. The web API translates
+the usual tool commands on the way to the printer, so CAM output works as-is:
+
+    M3 S<power>   / M4 S<power>   ->  M620 P<v> M621 P<v>
+    M5                            ->  M620 P0 M621 P0
+    M280 P<index> S<angle>        ->  M620 R<angle> M621 R<angle>
+
+`S` is scaled from the tool's range (1000 by default, as in LightBurn and
+GRBL) onto the board's 0-200.
+
 ## Completion markers
 
 Values from 201 up are not power or angle: they are completion markers for the

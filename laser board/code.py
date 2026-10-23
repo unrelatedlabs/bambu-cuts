@@ -569,6 +569,10 @@ def process_frame(buf: bytearray) -> bool:
 
         pkt_type = buf[4]
         payload = bytes(buf[5:L - 2])
+        if DUMP_BAD_FRAMES and len(payload) >= 3 and payload[0] * 4 + payload[1] >= MARKER_MIN:
+            # Capture accepted marker frames too, so the host has an exact
+            # template to diff a corrupted one against.
+            keep_bad_frame(buf, "good")
         if DEBUG:
             print(f"[SHORT] type=0x{pkt_type:02X} len={L} payload={payload.hex(' ')}")
         process_packet(payload)
