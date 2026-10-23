@@ -126,6 +126,15 @@ def _handle_marker(address, value, at):
     update_direct_job_from_marker(value, at, address=address)
 
 
+def _handle_marker_lost(reason):
+    """The side channel cannot be trusted right now: cover in-flight jobs.
+
+    Called from the reader thread when the port closes or a sequence gap
+    shows a marker was lost.
+    """
+    inject_mqtt_fallback(reason)
+
+
 def start_marker_link():
     """Start reading completion markers from the laser board.
 
@@ -144,6 +153,7 @@ def start_marker_link():
         marker_link = MarkerLink(
             device=cfg.get('marker_device') or None,
             on_marker=_handle_marker,
+            on_lost=_handle_marker_lost,
         )
     return marker_link.start()
 
@@ -248,6 +258,7 @@ def _merge_mqtt_print_status(print_status):
     # /api/status, so completion is recorded even with no browser open.
     _, mqtt_progress = current_mqtt_progress()
     update_direct_job_from_mqtt(mqtt_progress)
+    check_side_channel_watchdog()
 
 
 # Keep this many reports per job for the benchmark / job endpoints.
@@ -749,27 +760,50 @@ def direct_job_timeout_seconds(estimated_seconds: float) -> float:
 # laser board over the AMS-Lite bus and comes back over USB in milliseconds
 # (see bambucuts/marker_link.py). Codes run from SIDE_MARKER_MIN up, above
 # the 0-200 the board reads as a real servo angle, so the board can tell
-# them apart and leave its outputs alone. It is only appended when the board
-# is actually connected, and the MQTT marker remains as the fallback, so an
-# absent or wedged board costs latency and never correctness.
+# them apart and leave its outputs alone.
 #
-# The M400 before both (when used) drains queued motion first.
+# When the board is connected the batch carries ONLY the side-channel
+# marker: no M73 goes out, so the printer's own progress display is left
+# alone and nothing waits on its slow status snapshot. The MQTT marker is
+# instead injected later, and only if needed - see inject_mqtt_fallback().
+#
+# The M400 before the markers (when used) drains queued motion first.
 MARKER_FIELD = 'mc_percent'
 SIDE_MARKER_MIN = 201
 SIDE_MARKER_MAX = 251
+
+# How many consecutive codes each batch sends. The tap off the AMS-Lite pair
+# is single-ended and loses about 1.7% of frames to bit errors, so one marker
+# is not enough; two different codes give two independent chances and
+# measured 0 of 60 batches with no marker against 2 of 60 for a single one.
+#
+# They must differ: the printer collapses repeated identical `M620 R<n>` and
+# emits one frame however many times it is sent, so repeating a code buys
+# nothing. Consecutive codes cost about 100ms of latency once (51ms -> 155ms
+# median) and nothing further beyond two, which is why this is 2 and not more.
+SIDE_MARKER_REPEATS = 2
+
+# How long past a job's estimated run time to wait for its side-channel
+# marker before injecting the MQTT fallback. Injecting early is harmless:
+# the fallback is gated by its own M400, so it cannot report completion
+# before the motion is actually done, and the estimate ignores acceleration
+# and so runs short rather than long.
+SIDE_CHANNEL_GRACE_SECONDS = 2.0
 _side_marker_counter = itertools.count()
 
 
-def next_side_marker() -> int:
-    """Next side-channel marker code, cycling SIDE_MARKER_MIN..MAX.
+def next_side_marker_block(count: int = None) -> list:
+    """Next run of consecutive marker codes, cycling within the range.
 
-    Monotonic by construction, so queued batches get codes in order. A code
-    only comes back around after the whole range, and the matcher also
-    requires a marker to post-date the job it completes, so a stale code
-    still on the wire cannot resolve a later job.
+    Blocks advance by their own width, so successive batches never share a
+    code. A block only comes back around after the whole range, and the
+    matcher also requires a marker to post-date the job it completes, so a
+    stale code still on the wire cannot resolve a later job.
     """
-    span = SIDE_MARKER_MAX - SIDE_MARKER_MIN + 1
-    return SIDE_MARKER_MIN + next(_side_marker_counter) % span
+    count = count or SIDE_MARKER_REPEATS
+    span = SIDE_MARKER_MAX - SIDE_MARKER_MIN + 1 - (count - 1)
+    start = SIDE_MARKER_MIN + (next(_side_marker_counter) * count) % span
+    return list(range(start, start + count))
 
 
 def side_channel_ready() -> bool:
@@ -785,14 +819,19 @@ def side_channel_ready() -> bool:
 def next_marker_percent() -> int:
     """Pick the M73 percent for a new job so its report is unambiguous.
 
-    Chains after the newest in-flight job when there is one, so markers of
-    queued batches arrive in order; otherwise steps past what the printer
-    currently reports.
+    Chains after the newest in-flight job that has an MQTT marker, so
+    markers of queued batches arrive in order; otherwise steps past what
+    the printer currently reports. Side-channel jobs carry no MQTT marker
+    until one is injected, so they are skipped rather than chained from.
     """
     with direct_job_lock:
-        pending = _active_direct_jobs()
-    if pending:
-        return (int(pending[-1]['marker_value']) + 1) % 100
+        pending = [j.get('marker_value') for j in _active_direct_jobs()]
+    newest = next((v for v in reversed(pending) if v is not None), None)
+    if newest is not None:
+        try:
+            return (int(newest) + 1) % 100
+        except (TypeError, ValueError):
+            pass
     with mqtt_status_lock:
         current = (state['mqtt_status'].get('print') or {}).get(MARKER_FIELD)
     try:
@@ -809,8 +848,10 @@ def add_completion_marker(gcode_text: str, wait_for_motion: bool = True):
     the parser reaches them, a few moves ahead of the pen, which keeps
     motion continuous when another batch is queued behind.
 
-    The side-channel marker goes first so it is not held up behind the M73,
-    and is omitted when the laser board is not connected.
+    With the laser board connected the batch carries only the side-channel
+    marker; the MQTT M73 is not sent at all, and is injected later only if
+    the side channel fails (inject_mqtt_fallback). With no board it carries
+    the M73 exactly as it always did.
     """
     total_commands = sum(1 for _ in extract_executable_gcode(gcode_text))
     if total_commands == 0:
@@ -819,7 +860,7 @@ def add_completion_marker(gcode_text: str, wait_for_motion: bool = True):
             'command_count': 0,
             'marker_field': MARKER_FIELD,
             'marker_value': None,
-            'side_marker_value': None,
+            'side_marker_values': None,
             'side_marker_line': None,
             'marker_lines': [],
             'wait_for_motion': wait_for_motion,
@@ -827,26 +868,30 @@ def add_completion_marker(gcode_text: str, wait_for_motion: bool = True):
             'timeout_seconds': 0.0,
         }
 
-    percent = next_marker_percent()
-    marker_line = f"M73 P{percent} R0"
-    side_code = next_side_marker() if side_channel_ready() else None
-    side_line = f"M620 R{side_code} M621 R{side_code}" if side_code is not None else None
+    side_codes = next_side_marker_block() if side_channel_ready() else []
+    side_lines = [f"M620 R{c} M621 R{c}" for c in side_codes]
+    # The MQTT percent is allocated at injection time instead, so it reflects
+    # what the printer reports then rather than when the batch was built.
+    percent = None if side_lines else next_marker_percent()
+    marker_line = f"M73 P{percent} R0" if percent is not None else None
 
     estimated_seconds = estimate_gcode_seconds(gcode_text)
     marker_lines = [f"; bambucuts done marker: {total_commands} command(s)"]
     if wait_for_motion:
         marker_lines.append("M400 ; wait for queued motion to finish")
-    if side_line:
-        marker_lines.append(f"{side_line} ; laser board done marker")
-    marker_lines.append(marker_line)
+    for index, line in enumerate(side_lines):
+        marker_lines.append(f"{line} ; laser board done marker"
+                            + ("" if index == 0 else " (retry)"))
+    if marker_line:
+        marker_lines.append(marker_line)
     return '\n'.join([gcode_text.rstrip('\n'), *marker_lines]), {
         'enabled': True,
         'command_count': total_commands,
         'marker_line': marker_line,
         'marker_field': MARKER_FIELD,
-        'marker_value': str(percent),
-        'side_marker_value': str(side_code) if side_code is not None else None,
-        'side_marker_line': side_line,
+        'marker_value': str(percent) if percent is not None else None,
+        'side_marker_values': [str(c) for c in side_codes] or None,
+        'side_marker_line': side_lines[0] if side_lines else None,
         # The executable marker lines, so the send path can tell them from
         # the user's own G-code without matching on command prefixes.
         'marker_lines': [c for c in (strip_inline_comment(l) for l in marker_lines) if c],
@@ -901,8 +946,11 @@ def begin_direct_job(progress_info):
         'marker_line': progress_info.get('marker_line'),
         'marker_field': progress_info.get('marker_field', MARKER_FIELD),
         'marker_value': progress_info.get('marker_value'),
-        'side_marker_value': progress_info.get('side_marker_value'),
+        'side_marker_values': progress_info.get('side_marker_values'),
         'side_marker_line': progress_info.get('side_marker_line'),
+        # True once an MQTT marker exists for this job, either sent with the
+        # batch or injected later. Stops a second injection.
+        'fallback_sent': progress_info.get('marker_value') is not None,
         'wait_for_motion': progress_info.get('wait_for_motion', True),
         'estimated_seconds': progress_info.get('estimated_seconds', 0.0),
         'timeout_seconds': progress_info.get('timeout_seconds', DIRECT_JOB_MIN_TIMEOUT_SECONDS),
@@ -912,11 +960,14 @@ def begin_direct_job(progress_info):
         'message': 'Queueing G-code and waiting for the done marker',
     }
 
-    side = (f", side marker '{job['side_marker_line']}' expecting {job['side_marker_value']}"
-            if job['side_marker_value'] else ", no side marker (laser board not connected)")
-    print(f"Direct job {job['id']} started: {job['command_count']} command(s), "
-          f"marker '{job['marker_line']}' expecting {job['marker_field']}={job['marker_value']}"
-          f"{side}, estimated {job['estimated_seconds']}s, timeout {job['timeout_seconds']}s")
+    if job['side_marker_values']:
+        how = (f"side markers {'/'.join(job['side_marker_values'])}, "
+               f"no MQTT marker sent")
+    else:
+        how = (f"marker '{job['marker_line']}' expecting "
+               f"{job['marker_field']}={job['marker_value']}")
+    print(f"Direct job {job['id']} started: {job['command_count']} command(s), {how}, "
+          f"estimated {job['estimated_seconds']}s, timeout {job['timeout_seconds']}s")
 
     with direct_job_lock:
         in_flight = _active_direct_jobs()
@@ -996,17 +1047,37 @@ def _stall_check_all(mqtt_progress):
     return dict(state.get('direct_job') or {})
 
 
+def _job_expects(job, field, value):
+    """Whether this job is waiting for `value` on `field`.
+
+    The field holds a list for the side channel, where a batch sends several
+    consecutive codes and any one of them arriving confirms it, and a single
+    value for the MQTT marker.
+    """
+    expected = job.get(field)
+    if expected is None:
+        return False
+    if isinstance(expected, (list, tuple)):
+        return any(str(value) == str(e) for e in expected)
+    return str(value) == str(expected)
+
+
 def _find_marker_job(active, value, at, field):
-    """Index of the in-flight job waiting for this marker, or None.
+    """Index of the newest in-flight job waiting for this marker, or None.
 
     The timestamp guard rejects a marker older than the job it would
     complete. That matters most on the side channel, where codes cycle
     through a small range and nothing else separates a stale marker still
     on the wire from the one this job is waiting for.
+
+    The newest match, not the first: one injected fallback marker covers
+    every job in flight, so they share a value, and the caller completes
+    everything up to the index returned. Values are unique per job
+    otherwise, where newest and first are the same thing.
     """
-    return next((i for i, j in enumerate(active)
-                 if str(value) == str(j.get(field))
-                 and at >= j.get('started_at', 0)), None)
+    return next((i for i in range(len(active) - 1, -1, -1)
+                 if _job_expects(active[i], field, value)
+                 and at >= active[i].get('started_at', 0)), None)
 
 
 def _complete_matched_jobs(active, matched, at, source, detail, annotate=None):
@@ -1089,14 +1160,14 @@ def update_direct_job_from_marker(value, at, address=None):
         if not active:
             return dict(state.get('direct_job') or {})
 
-        matched = _find_marker_job(active, value, at, 'side_marker_value')
+        matched = _find_marker_job(active, value, at, 'side_marker_values')
         if matched is None:
             # Worth a line rather than silence. The likeliest cause is the
             # printer encoding `M620 R<n>` as something other than the n we
             # wrote, which shows up here as a marker whose value no job
             # expects. The job still completes on its MQTT marker, so the
             # symptom is lost speed, not a stuck job.
-            expected = [j.get('side_marker_value') for j in active]
+            expected = [j.get('side_marker_values') for j in active]
             print(f"Marker {value} (address {address}) matches no in-flight job, "
                   f"which expect {expected}; falling back to the MQTT marker")
             return dict(state.get('direct_job') or {})
@@ -1104,6 +1175,82 @@ def update_direct_job_from_marker(value, at, address=None):
         _complete_matched_jobs(active, matched, at, 'side-channel',
                                f"laser board marker {value}")
         return dict(state.get('direct_job') or {})
+
+
+def _jobs_awaiting_fallback(now=None):
+    """In-flight side-channel jobs with no MQTT marker to fall back on.
+
+    Caller must NOT hold direct_job_lock. Returns them oldest first; an
+    empty list means every in-flight job is already covered.
+    """
+    now = now or time.time()
+    with direct_job_lock:
+        return [dict(j) for j in _active_direct_jobs()
+                if j.get('side_marker_values') and not j.get('fallback_sent')
+                and j.get('queued_at')]
+
+
+def inject_mqtt_fallback(reason):
+    """Send an MQTT done marker for in-flight jobs the side channel may have lost.
+
+    One marker covers every job in flight. It queues behind everything
+    already sent, so by the time it executes all of those jobs have run,
+    and _complete_matched_jobs resolves them together. Its own M400 is what
+    keeps it exact, so injecting this early or needlessly is harmless.
+
+    This is the whole reason no M73 goes out with the batch: the MQTT path
+    costs nothing until the side channel actually lets us down.
+    """
+    pending = _jobs_awaiting_fallback()
+    if not pending:
+        return None
+    if not state['printer_connected']:
+        print(f"Cannot inject MQTT fallback ({reason}): printer not connected")
+        return None
+
+    percent = next_marker_percent()
+    lines = ["M400", f"M73 P{percent} R0"]
+
+    # Claim the jobs before sending, so a second trigger cannot double-inject.
+    with direct_job_lock:
+        claimed = []
+        for job in _active_direct_jobs():
+            if job.get('side_marker_values') and not job.get('fallback_sent'):
+                job['fallback_sent'] = True
+                job['marker_value'] = str(percent)
+                job['marker_line'] = lines[1]
+                job['fallback_reason'] = reason
+                _store_direct_job(job)
+                claimed.append(job['id'])
+    if not claimed:
+        return None
+
+    print(f"Injecting MQTT fallback marker {MARKER_FIELD}={percent} for "
+          f"{len(claimed)} job(s): {reason}")
+    if not send_gcode_lines_to_printer(lines):
+        # Leave fallback_sent set: retrying would only queue another marker
+        # behind the first. The stall timeout remains the backstop.
+        print("Failed to send the MQTT fallback marker; job(s) rely on the stall timeout")
+    for line in lines:
+        add_to_history(line)
+    return percent
+
+
+def check_side_channel_watchdog():
+    """Inject the MQTT fallback for any job whose marker is overdue.
+
+    The side channel reports within a few hundred milliseconds of the motion
+    ending, so a job past its estimate plus the grace period has very likely
+    lost its marker - or the board went away without the port noticing.
+    Called wherever job state is already being refreshed.
+    """
+    now = time.time()
+    overdue = [j for j in _jobs_awaiting_fallback(now)
+               if now - j['queued_at'] > (j.get('estimated_seconds') or 0.0)
+               + SIDE_CHANNEL_GRACE_SECONDS]
+    if overdue:
+        waited = now - min(j['queued_at'] for j in overdue)
+        inject_mqtt_fallback(f'no side-channel marker after {waited:.1f}s')
 
 
 def current_mqtt_progress():
@@ -1798,6 +1945,7 @@ def wait_for_direct_job(job_id: str, poll_seconds: float = 0.02, stop_event=None
             return job
         _, mqtt_progress = current_mqtt_progress()
         update_direct_job_from_mqtt(mqtt_progress)
+        check_side_channel_watchdog()
         time.sleep(poll_seconds)
 
 

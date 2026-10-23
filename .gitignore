@@ -76,6 +76,8 @@ config.py.bak
 # Test files
 test_files/
 test_*.py
+# ...but the project's own test suite is not scratch work.
+!tests/test_*.py
 badge*.svg
 badge*.gcode
 circle*.gcode

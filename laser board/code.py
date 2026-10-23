@@ -42,10 +42,25 @@ import microcontroller
 import pwmio
 import usb_cdc
 
-# Per-frame tracing on the console. Off by default: the UART loop reads at
-# 1.2 Mbaud and the servo needs a pulse every 20 ms, so three print() calls
-# per decoded frame are enough to cost frames and jitter the servo.
+# Raw frame tracing ([SHORT]/[LONG] headers and payload hex) on the console.
+# Off by default: the UART loop reads at 1.2 Mbaud and the servo needs a pulse
+# every 20 ms, so printing per bus frame costs frames and jitters the servo.
+# The decoded `a=/v=` line is always printed - see process_packet().
 DEBUG = False
+
+# Capture frames that fail validation and dump their hex on the next status
+# line, to tell a line error from a dropped byte: a single flipped bit leaves
+# the frame structurally intact, while a missing byte makes the accumulator
+# swallow the start of the following frame. Only an append happens in the
+# frame path, so this barely perturbs what it measures.
+DUMP_BAD_FRAMES = False
+BAD_FRAME_KEEP = 6
+bad_frames = []
+
+
+def keep_bad_frame(buf, why):
+    if DUMP_BAD_FRAMES and len(bad_frames) < BAD_FRAME_KEEP:
+        bad_frames.append((why, bytes(buf)))
 
 # Try board.LED first; if it doesn't exist, manually set GPIO15
 
@@ -142,40 +157,96 @@ def servo_update():
 # to 180, so an unintercepted marker would park the servo at full deflection.
 MARKER_MIN = 201
 
-# Prefer the dedicated data port from boot.py, so markers do not share the
-# console with debug output and a terminal on the REPL cannot eat them.
-marker_port = usb_cdc.data          # None unless boot.py enabled it
-if marker_port is not None:
-    # Never block the UART loop waiting for the host to drain the buffer.
-    marker_port.timeout = 0
-    marker_port.write_timeout = 0
+# Markers and log lines share the one CDC console. The ESP32-S2 has too few
+# USB endpoints to add a second CDC interface alongside the CIRCUITPY drive,
+# so there is nothing to be gained by trying.
+#
+# Sharing it means output must have exactly one writer. A marker written in
+# two parts with a log line in between would reach the host as a corrupt
+# line, so every line goes through one queue, drained only by flush_out().
+marker_port = usb_cdc.console
+# Never block the UART loop waiting for the host to drain its buffer: it
+# reads at 1.2 Mbaud and the servo needs a pulse every 20 ms.
+marker_port.timeout = 0
+marker_port.write_timeout = 0
 
 markers_sent = 0
 markers_dropped = 0
+marker_seq = 0
+
+# Lines waiting for the console to accept them, each [bytes, keep]. The host
+# may rely on this channel alone, so a marker must survive a momentarily
+# full buffer rather than being thrown away.
+out_backlog = []
+
+# Cap the backlog so a host that stopped reading cannot exhaust memory. One
+# marker per batch means this is never approached in normal use.
+OUT_BACKLOG_MAX = 48
+
+
+def emit(text, keep=False):
+    """Queue one line for the console. Never blocks.
+
+    keep marks a line that must not be shed under pressure: a marker is
+    never dropped to make room for a log line.
+    """
+    global markers_dropped
+    data = text.encode("ascii") if isinstance(text, str) else text
+    if len(out_backlog) >= OUT_BACKLOG_MAX:
+        shed = None
+        for i in range(len(out_backlog)):
+            if not out_backlog[i][1]:
+                shed = i
+                break
+        if shed is None:
+            # All markers: drop the oldest, which is the least useful now,
+            # and count it so the status line shows the channel is failing.
+            del out_backlog[0]
+            markers_dropped += 1
+        else:
+            del out_backlog[shed]
+    out_backlog.append([data, keep])
+    flush_out()
 
 
 def report_marker(address, value):
-    """Send one marker line to the host, without ever blocking.
-
-    Dropping a marker is safe: the host also appends an M73 fallback and
-    completes the job off whichever arrives first, so a full buffer or a
-    closed port costs latency, not correctness.
-    """
-    global markers_sent, markers_dropped
-    line = "MARK %d %d %d\n" % (address, value, time.monotonic_ns() // 1000000)
-    if marker_port is None:
-        # No data port: the console is all we have.
-        print(line, end="")
-        markers_sent += 1
-        return
+    """Queue one marker for the host. Never blocks, never silently drops one."""
+    global marker_seq, markers_dropped
+    marker_seq = (marker_seq + 1) % 1000000
     if not marker_port.connected:
+        # Nobody is listening, so no job is waiting on this marker: the host
+        # saw the port close and falls back to MQTT for anything in flight.
+        # Queueing it would only deliver it stale later.
         markers_dropped += 1
         return
-    try:
-        marker_port.write(line.encode("ascii"))
-        markers_sent += 1
-    except OSError:
-        markers_dropped += 1
+    emit("MARK %d %d %d %d\n" % (address, value,
+                                 time.monotonic_ns() // 1000000, marker_seq),
+         keep=True)
+
+
+def flush_out():
+    """Hand as much of the backlog to the console as it will take right now.
+
+    write_timeout is 0, so a write returns immediately having accepted some
+    or none of the bytes. A partial write leaves the remainder at the head
+    of the queue to be retried, and since this is the only writer, nothing
+    can be interleaved into the gap.
+    """
+    global markers_sent
+    while out_backlog:
+        if not marker_port.connected:
+            return
+        data, keep = out_backlog[0]
+        try:
+            written = marker_port.write(data) or 0
+        except OSError:
+            return          # console busy; try again on the next pass
+        if written < len(data):
+            out_backlog[0][0] = data[written:]
+            return
+        del out_backlog[0]
+        if keep:
+            markers_sent += 1
 
 
 
@@ -189,9 +260,34 @@ led2a.value=0
 led.value = 1
 
 
+# GPIO2 feeds GPIO1 (UART RX) through the 510 ohm resistor, and so sets the
+# idle level of this single-ended tap off a differential pair. How hard it
+# pulls matters: every corrupted bit observed on this link is 0 -> 1, which
+# is what lows failing to reach the input threshold look like, i.e. a pull-up
+# the bus driver cannot overcome.
+#
+#   "strong"   - GPIO2 driven high: a stiff 510 ohm pull-up (~6.5 mA)
+#   "weak"     - GPIO2 an input with its internal pull-up, ~45k in series
+#                with the 510 ohm, so a gentle pull-up
+#   "off"      - GPIO2 high-Z: no bias at all
+#   "down"     - GPIO2 driven low: a stiff 510 ohm pull-down, which pulls
+#                lows firmly down at the cost of fighting the highs
+#   "weakdown" - GPIO2 an input with its internal pull-down
+#
+# Measured on this rig: "strong" gives ~5% frame errors, "weak" corrupts
+# every frame and "off" receives nothing at all, so the 510 ohm is carrying
+# the signal level rather than merely biasing an idle line.
+PULLUP_MODE = "strong"
+
 pullup = digitalio.DigitalInOut(microcontroller.pin.GPIO2)
-pullup.direction = digitalio.Direction.OUTPUT
-pullup.value=1
+if PULLUP_MODE in ("strong", "down"):
+    pullup.direction = digitalio.Direction.OUTPUT
+    pullup.value = 1 if PULLUP_MODE == "strong" else 0
+else:
+    pullup.direction = digitalio.Direction.INPUT
+    pullup.pull = (digitalio.Pull.UP if PULLUP_MODE == "weak"
+                   else digitalio.Pull.DOWN if PULLUP_MODE == "weakdown"
+                   else None)
 
 # ===== CRC Helpers (no xor, no reverse) =====
 def crc8_0x39(data: bytes, init: int = 0x66) -> int:
@@ -279,6 +375,7 @@ def finish_if_complete():
             ok_frames += 1
         reset()
         servo_update()   # keep the servo fed while a burst of frames is parsed
+        flush_out()
         return True
     elif expected_len and len(frame) > expected_len:
         print("Bad frame", frame.hex())
@@ -305,13 +402,12 @@ def set_power(power):
 def process_packet(payload):
     global last_power_countdown
     try:
-        if DEBUG:
-            print("Payload",payload.hex(' '));
         value = payload[0] * 4 + payload[1]
         address = payload[2]
 
-        if DEBUG:
-            print(f"a={address}, v={value}")
+        # The decoded command, always. Only non-KNOWN short frames reach here,
+        # so this is one line per real command rather than per bus frame.
+        emit(f"a={address}, v={value}\n")
 
         if value >= MARKER_MIN:
             # A host completion marker, not a power or angle. Report it and
@@ -353,11 +449,13 @@ def process_frame(buf: bytearray) -> bool:
         L = (buf[5] << 8) | buf[4]
         if L != len(buf):
             len_err += 1
+            keep_bad_frame(buf, "len-long")
             print("Bad length (long):", len(buf), "expected:", L)
             return False
 
         if crc8_0x39(bytes(buf[0:6])) != buf[6]:
             crc_err += 1
+            keep_bad_frame(buf, "crc8-long")
             print("Bad CRC8 (long)")
             return False
 
@@ -366,6 +464,7 @@ def process_frame(buf: bytearray) -> bool:
         crc_seen = buf[L - 2] | (buf[L - 1] << 8)
         if crc_calc != crc_seen:
             crc_err += 1
+            keep_bad_frame(buf, "crc16-long")
             print("Bad CRC16 (long)")
             return False
 
@@ -386,11 +485,13 @@ def process_frame(buf: bytearray) -> bool:
         L = buf[2]
         if L != len(buf):
             len_err += 1
+            keep_bad_frame(buf, "len-short")
             print("Bad length (short):", len(buf), "expected:", L)
             return False
         c8 = crc8_0x39(bytes(buf[0:3]))
         if c8 != buf[3]:
             crc_err += 1
+            keep_bad_frame(buf, "crc8-short")
             print(f"Bad CRC8 (short) {c8} != {buf[3]}")
             return False
 
@@ -399,6 +500,7 @@ def process_frame(buf: bytearray) -> bool:
         crc_seen = buf[L - 2] | (buf[L - 1] << 8)
         if crc_calc != crc_seen:
             crc_err += 1
+            keep_bad_frame(buf, "crc16-short")
             print(f"Bad CRC16 (short) {crc_calc} != {crc_seen}")
             return False
 
@@ -429,12 +531,16 @@ def tick():
 while True:
     b = uart.read(100)
     servo_update()
+    flush_out()
     now = time.monotonic()
     if now - last_report >= 1:
-        print(f"[status] ok={ok_frames} crc_err={crc_err} len_err={len_err} buf={len(frame)} "
-              f"servo_gap={servo_max_gap_ns // 1_000_000}ms "
-              f"marks={markers_sent}/{markers_dropped} "
-              f"host={'up' if marker_port is None or marker_port.connected else 'down'}")
+        emit(f"[status] ok={ok_frames} crc_err={crc_err} len_err={len_err} buf={len(frame)} "
+             f"servo_gap={servo_max_gap_ns // 1_000_000}ms "
+             f"marks={markers_sent}/{markers_dropped}/{len(out_backlog)} "
+             f"host={'up' if marker_port.connected else 'down'}\n")
+        while bad_frames:
+            why, raw = bad_frames.pop(0)
+            emit("BADFRAME %s %s\n" % (why, raw.hex()))
         servo_max_gap_ns = 0
         last_report = now
         tick()

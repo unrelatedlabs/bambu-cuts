@@ -49,11 +49,17 @@ not share the console with debug output. It only takes effect on a hard reset
 or power cycle. `code.py` falls back to the console when that port is absent,
 so `boot.py` is optional.
 
-Per-frame tracing is behind `DEBUG` in `code.py`, off by default: the UART loop
-reads at 1.2 Mbaud and the servo needs a pulse every 20 ms, so three `print()`
-calls per decoded frame are enough to cost frames and jitter the servo. The
-once-a-second `[status]` line is always on and reports frame counts, the worst
-gap between servo updates, markers sent and dropped, and whether the host is
+Raw frame tracing (`[SHORT]`/`[LONG]` headers and payload hex) is behind `DEBUG`
+in `code.py`, off by default: the UART loop reads at 1.2 Mbaud and the servo
+needs a pulse every 20 ms, so printing per bus frame costs frames and jitters
+the servo. It also floods the USB console badly enough that the board stops
+accepting input at all, which locks you out of the REPL.
+
+The decoded `a=<address>, v=<value>` line is always printed. Only non-`KNOWN`
+short frames reach it, so that is one line per real command, not per bus frame.
+
+The once-a-second `[status]` line reports frame counts, the worst gap between
+servo updates, `marks=<sent>/<dropped>/<backlog>`, and whether the host is
 reading.
 
 ## GCode File preparation 
@@ -94,12 +100,16 @@ full deflection.
 
 The board emits one line per marker on its data port:
 
-    MARK <address> <value> <board_uptime_ms>
+    MARK <address> <value> <board_uptime_ms> <seq>
+
+`seq` is monotonic so the host can detect a lost marker as a gap. Markers are
+queued and retried until the port accepts them, never dropped on a busy port
+and never blocking the UART loop.
 
 bambucuts appends one of these to each batch of direct G-code and completes the
-job when it comes back, which takes milliseconds against the 1 to 2 seconds the
-printer's own MQTT progress report needs. See "G-code progress over MQTT" in
-the top-level README.
+job when it comes back, roughly 200 ms against the 2 to 3.5 s the printer's own
+MQTT progress report needs. With the board connected no `M73` is sent at all.
+See "G-code progress over MQTT" in the top-level README.
 
 ## Protocol details 
 

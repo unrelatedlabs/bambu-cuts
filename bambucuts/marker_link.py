@@ -12,9 +12,15 @@ The host appends both markers to a batch and completes the job off
 whichever arrives first, so this is an accelerator: with no board attached,
 or with a wedged one, jobs still complete on the MQTT marker as before.
 
-The board emits one line per marker on its USB data port:
+The board emits one line per marker on its USB console, mixed in with its
+own log lines:
 
-    MARK <address> <value> <board_uptime_ms>
+    MARK <address> <value> <board_uptime_ms> <seq>
+
+`seq` is monotonic, so a dropped marker is detected here as a gap rather
+than inferred later from a job that never completed. That matters because
+the host does not send an MQTT marker at all while this channel is healthy:
+a gap, like a closed port, is what triggers the fallback.
 
 `address` is 0 for the laser channel (`M620 P`) and 1 for the servo
 (`M620 R`); `value` is the marker code, 201 and up. Markers go out on the
@@ -43,19 +49,18 @@ READ_TIMEOUT = 0.2
 # Recent markers kept for the status endpoint.
 MARKER_LOG_LIMIT = 50
 
-# Where to look for the board when no device is configured. The data port
-# that boot.py enables is preferred; -if00 is the console, which code.py
-# falls back to when the data port is not enabled.
+# Where to look for the board when no device is configured. The board has a
+# single CDC interface - the ESP32-S2 has too few USB endpoints to add a
+# second one alongside the CIRCUITPY drive - so markers share the console
+# with its log lines, and anything that is not a marker is ignored here.
 DEVICE_GLOBS = (
-    '/dev/serial/by-id/usb-Lolin_S2_Mini_*-if02',
-    '/dev/serial/by-id/usb-*S2_Mini*-if02',
     '/dev/serial/by-id/usb-Lolin_S2_Mini_*-if00',
     '/dev/serial/by-id/usb-*S2_Mini*-if00',
 )
 
 
 def find_device():
-    """First matching board path, preferring the dedicated data port.
+    """First matching board path, or None.
 
     Paths under /dev/serial/by-id carry the board's UID, so they survive a
     replug where /dev/ttyACM<n> can renumber.
@@ -68,10 +73,11 @@ def find_device():
 
 
 def parse_marker(line: str):
-    """Parse one `MARK <address> <value> <uptime_ms>` line, else None.
+    """Parse one `MARK <address> <value> <uptime_ms> <seq>` line, else None.
 
     Anything else on the port - the board's own status and debug output when
-    markers fall back to the console - is not a marker.
+    markers fall back to the console - is not a marker. The trailing fields
+    are optional so an older board still reports usable markers.
     """
     parts = line.split()
     if len(parts) < 3 or parts[0] != 'MARK':
@@ -81,11 +87,18 @@ def parse_marker(line: str):
         value = int(parts[2])
     except ValueError:
         return None
-    try:
-        board_ms = int(parts[3]) if len(parts) > 3 else None
-    except ValueError:
-        board_ms = None
-    return {'address': address, 'value': value, 'board_ms': board_ms}
+
+    def opt(index):
+        try:
+            return int(parts[index]) if len(parts) > index else None
+        except ValueError:
+            return None
+
+    return {'address': address, 'value': value, 'board_ms': opt(3), 'seq': opt(4)}
+
+
+# The board wraps its sequence number at this many markers.
+SEQ_MODULUS = 1000000
 
 
 class MarkerLink:
@@ -95,9 +108,13 @@ class MarkerLink:
     must be quick and must not assume the Flask request context.
     """
 
-    def __init__(self, device=None, on_marker=None, enabled=True):
+    def __init__(self, device=None, on_marker=None, on_lost=None, enabled=True):
         self._configured_device = device or None
         self._on_marker = on_marker
+        # Called as on_lost(reason) when delivery can no longer be trusted:
+        # the port closed, or a sequence gap proved a marker was lost. The
+        # host uses it to fall back for anything still in flight.
+        self._on_lost = on_lost
         self._enabled = enabled
         self._thread = None
         self._stop = threading.Event()
@@ -111,6 +128,9 @@ class MarkerLink:
             'last_marker': None,
             'last_update': None,
             'opened_at': None,
+            'last_seq': None,
+            'gap_count': 0,
+            'lost_estimate': 0,
             'log': [],
         }
 
@@ -152,6 +172,31 @@ class MarkerLink:
     def _set(self, **changes):
         with self._lock:
             self._state.update(changes)
+
+    def _check_sequence(self, marker):
+        """Return a reason string if this marker proves one was lost, else None.
+
+        The board's counter wraps, so the gap is measured modulo the wrap. A
+        lower sequence than the last means the board restarted, which the
+        port closing already reported, so it is not counted as loss.
+        """
+        seq = marker.get('seq')
+        if seq is None:
+            return None
+        with self._lock:
+            last = self._state.get('last_seq')
+            self._state['last_seq'] = seq
+            if last is None:
+                return None
+            missing = (seq - last - 1) % SEQ_MODULUS
+            if missing == 0:
+                return None
+            if missing > SEQ_MODULUS // 2:
+                return None          # board restarted, not loss
+            self._state['gap_count'] += 1
+            self._state['lost_estimate'] += missing
+        return (f'sequence gap: {missing} marker(s) lost between '
+                f'seq {last} and {seq}')
 
     def _record(self, marker, at):
         with self._lock:
@@ -207,7 +252,14 @@ class MarkerLink:
             if marker is None:
                 continue
             at = time.time()
+            gap = self._check_sequence(marker)
             self._record(marker, at)
+            if gap and self._on_lost:
+                print(f"Marker side channel {gap}")
+                try:
+                    self._on_lost(gap)
+                except Exception as e:
+                    print(f"Marker loss callback failed: {e}")
             if self._on_marker:
                 try:
                     self._on_marker(marker['address'], marker['value'], at)
@@ -228,6 +280,12 @@ class MarkerLink:
                     port.close()
                 except Exception:
                     pass
-                self._set(connected=False)
+                self._set(connected=False, last_seq=None)
+                if self._on_lost and not self._stop.is_set():
+                    reason = self.status().get('error') or 'marker port closed'
+                    try:
+                        self._on_lost(reason)
+                    except Exception as e:
+                        print(f"Marker loss callback failed: {e}")
             if self._stop.wait(RECONNECT_DELAY):
                 break

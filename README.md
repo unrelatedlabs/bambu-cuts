@@ -261,12 +261,18 @@ curl -N "http://localhost:5425/api/mqtt-stream?seconds=60&count=0"
 
 `M73 P<percent> R<remaining>` updates the printer's MQTT progress fields, such as `mc_percent` and `mc_remaining_time`.
 
-When G-code is sent from the web UI, Bambu Cuts appends a done marker after the last command. With the laser board connected there are two of them, and whichever comes back first completes the job — see [the side channel](#faster-done-signal-the-laser-board-side-channel) below:
+When G-code is sent from the web UI, Bambu Cuts appends one done marker after the last command:
+
+```gcode
+M400
+M73 P43 R0
+```
+
+With the laser board connected it appends a faster marker instead and sends no `M73` at all — see [the side channel](#faster-done-signal-the-laser-board-side-channel) below:
 
 ```gcode
 M400
 M620 R201 M621 R201
-M73 P43 R0
 ```
 
 `M400` waits for all queued motion to finish before the `M73` runs, so seeing that exact `mc_percent` with `mc_remaining_time` = 0 in MQTT means the whole batch has completed. The percent is chosen as the printer's current `mc_percent` + 1 so it always produces a fresh MQTT delta. Only a single marker is used, because every `M400` forces the planner to a full stop, which would leave a pen dwell or laser spot at each checkpoint.
@@ -304,33 +310,89 @@ While a job is active the server log prints one line per MQTT report (`MQTT repo
 
 ### Faster done signal: the laser board side channel
 
-That 1.7 s is reporting lag, not motion — `M400` has already drained the queue by the time the marker runs, and the delay is purely how long the printer's status snapshot takes to notice. The [laser board](laser%20board/) offers a way around it: it sits on the AMS-Lite bus and decodes an `M620` within a millisecond of the printer executing it, so a marker sent through the board and read back over USB confirms a batch in milliseconds instead of seconds.
+That 1.7 s is reporting lag, not motion — `M400` has already drained the queue by the time the marker runs, and the delay is purely how long the printer's status snapshot takes to notice. The [laser board](laser%20board/) offers a way around it: it sits on the AMS-Lite bus and decodes an `M620` within a millisecond of the printer executing it, so a marker sent through the board and read back over USB confirms a batch in a fraction of the time.
 
-The marker is `M620 R<code> M621 R<code>` with a code from 201 to 251. Real servo angles and laser powers only go up to 200, so the firmware can tell a marker apart from a command and reports it to the host instead of moving anything. It checks the range *before* dispatching on the channel, which matters because `set_servo()` clamps to 180 — an unintercepted marker would park the servo at full deflection.
+**With the board connected, no `M73` is sent at all.** The batch carries only side-channel markers:
+
+```gcode
+M400
+M620 R201 M621 R201
+M620 R202 M621 R202
+```
+
+Two *consecutive* codes, not one repeated: the printer collapses repeated identical `M620 R<n>` and emits a single bus frame however many times it is sent, so repetition buys nothing, while different codes give two independent chances at a lossy link. The marker code runs 201 to 251. Real servo angles and laser powers only go up to 200, so the firmware tells a marker from a command and reports it to the host instead of moving anything. It checks the range *before* dispatching on the channel, which matters because `set_servo()` clamps to 180 — an unintercepted marker would park the servo at full deflection.
 
 The board writes one line per marker on its USB data port, and `bambucuts/marker_link.py` reads them:
 
 ```
-MARK <address> <value> <board_uptime_ms>
+MARK <address> <value> <board_uptime_ms> <seq>
 ```
 
 `address` is 0 for the laser channel and 1 for the servo. Markers go out on the servo channel, but a marker is matched on its value alone and the address only recorded: nothing real reaches 201, so there is nothing to gain by being strict. The board's uptime is for debugging only — arrival at the host is what gets timestamped, since the two clocks share no origin.
 
-This is an accelerator, never a dependency. Every batch still carries its `M73`, the `M620` is only appended when the board is actually connected, and a job completes on whichever marker arrives first. An absent, unplugged or wedged board costs latency and nothing else. Completed jobs and benchmark runs record which channel won under `detect_source` (`side-channel` or `mqtt`).
+#### Making it reliable
 
-To set it up:
+With no `M73` in the batch there is no second chance, so a marker must not be quietly lost. Three mechanisms cover that:
 
-1. Copy `laser board/boot.py` and `laser board/code.py` to the board's `CIRCUITPY` drive. `boot.py` enables a second USB serial port so markers do not share the console with debug output and a terminal on the REPL cannot eat them; `code.py` falls back to the console if it is missing, so `boot.py` is an optimisation rather than a requirement. It only takes effect on a hard reset or power cycle.
-2. Install `pyserial`. Without it the side channel logs that it is unavailable and everything falls back to MQTT.
-3. Give the server access to the port. The board appears as `root:uucp`, so the server's user needs to be in the `uucp` group (`sudo usermod -aG uucp $USER`, then log back in) or be granted access by a udev rule.
+- **The board queues markers rather than dropping them.** `report_marker()` appends to a backlog and `flush_markers()` drains whatever the port accepts, from the main loop and between frames of a burst. `write_timeout` is 0, so a partial write leaves the remainder at the head of the queue to be retried. The UART loop still never blocks — it reads at 1.2 Mbaud and the servo needs a pulse every 20 ms. The backlog is capped so a host that stopped reading cannot exhaust memory; hitting the cap counts as a drop, which is a bug worth seeing.
+- **Sequence numbers make loss visible.** `seq` is monotonic, so the host detects a gap on the next marker instead of inferring it later from a job that never finished. A sequence that goes backwards means the board restarted, which the port closing already reported, and is not counted as loss.
+- **The MQTT marker is injected lazily, only when needed.** On a port close, a sequence gap, or a job running past its estimate plus a 2 s grace, the host sends `M400` + `M73 P<n> R0` *then*. Because it queues behind everything already sent, it is gated just as exactly as one sent upfront, so injecting early or needlessly is harmless. One injected marker covers every job in flight. The stall timeout remains the last resort.
 
-The board is found automatically under `/dev/serial/by-id`, which is keyed to its UID and so survives a replug that renumbers `/dev/ttyACM*`. The data port that `boot.py` enables is preferred over the console. Set `marker_device` in the profile config to pin a specific path, or `marker_enabled: false` to turn the channel off and go back to MQTT-only completion. `/api/status` reports the channel under `marker_link`, and the reader reopens the port on error — the board resets whenever its `code.py` is saved.
+The practical failure this guards against is not bus loss — laser power rides on the same frames, so a lossy bus would already make the laser unsafe — but USB going away mid-job. The board resets every time its `code.py` is saved, which happens a lot while developing. Lazy fallback turns that from a stalled job with `head.uncertain` set into a couple of seconds of delay.
 
-One thing to confirm on hardware, because the captures in [`laser board/README.md`](laser%20board/README.md) disagree about it: whether `M620 R<n>` reaches the board as value `n`. `M620 P255` decodes to 255, a clean 1:1 mapping, but the `M620 R1` capture decodes to 2. The host assumes 1:1. If it is wrong the symptom is only lost speed — jobs still complete on their `M73` — and the server log says so explicitly, naming the value that arrived and the ones the in-flight jobs expected:
+The board's once-a-second status line reports `marks=<sent>/<dropped>/<backlog>`, and `/api/status` carries `marker_link` with `marker_count`, `gap_count` and `lost_estimate`. Those are the numbers that substantiate a reliability claim; across a run they should all be zero but `sent`.
+
+#### Setting it up
+
+1. Copy `laser board/boot.py` and `laser board/code.py` to the board's `CIRCUITPY` drive. `boot.py` enables a second USB serial port so markers do not share the console with debug output and a terminal on the REPL cannot eat them; `code.py` falls back to the console when it is missing, so `boot.py` is an optimisation rather than a requirement. It only takes effect on a hard reset or power cycle.
+2. Install `pyserial`. Without it the side channel logs that it is unavailable and every batch carries its `M73` as before.
+3. Give the server access to the port. A udev rule keyed to the board is the durable fix — note that `TAG+="uaccess"` does **not** work here, because `uaccess` only applies to devices assigned to a logind seat and `tty` devices are not:
 
 ```
-Marker 402 (address 1) matches no in-flight job, which expect ['201']; falling back to the MQTT marker
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="80c3", GROUP="wheel", MODE="0660"
 ```
+
+The board is found automatically under `/dev/serial/by-id`, which is keyed to its UID and so survives a replug that renumbers `/dev/ttyACM*`. The data port that `boot.py` enables is preferred over the console. Set `marker_device` in the profile config to pin a specific path, or `marker_enabled: false` to turn the channel off and go back to MQTT-only completion. The reader reopens the port on error.
+
+If the drive shows up read-only, that is the board holding its own filesystem, not a mount problem — `/sys/block/<dev>/ro` will read `1` and no mount option will change it. Reset or replug the board.
+
+#### Measured
+
+All on an A1 in October 2026, against the firmware in `laser board/`.
+
+**Encoding.** `M620 R<n>` reaches the board as value `n`. Confirmed for 201, 225 and 251 (payloads `32 01 01`, `38 01 01`, `3e 03 01`, decoding as `p[0]*4 + p[1]` on address 1), and the printer accepts arguments above 200 without complaint. An `M620 R1` capture in [`laser board/README.md`](laser%20board/README.md) that decodes to 2 is simply wrong; the mapping is 1:1.
+
+**Latency.** On identical no-motion batches:
+
+| | done signal after queueing |
+|---|---|
+| side channel, one marker | 51 ms median |
+| side channel, two consecutive markers | ~155 ms median |
+| MQTT marker | 3.46 s median |
+
+Only 2.7 ms of that is host-side HTTP and MQTT publish; the rest is the printer accepting and executing the command, which no amount of cleverness here removes. Carrying the `M73` alongside costs nothing measurable (51 ms vs 52 ms). A second marker costs ~100 ms once; a third and fifth cost nothing further and buy nothing, which is why the default is two.
+
+With a 141.4 mm move at 3000 mm/min (2.8 s of motion), the MQTT path took 5.78 s to confirm — 2.98 s of overhead after the motion ended, because the printer reports on a hard ~1.04 s cadence *and* its snapshot lags an executed `M73` by a further 1 to 2 s. Reports arriving 0.3 s and 1.4 s after the motion finished still carried the old value.
+
+**Delivery.** Over 1100 batches, USB delivery was perfect: zero sequence gaps, zero drops, zero split lines, peak backlog 36 of 48. Every loss was upstream of the board, at about 1.1 to 1.7% of batches with a single marker, and 0 of 60 with two consecutive ones.
+
+Note that sequence numbers only catch loss *between the board and the host*. A frame corrupted on the bus never becomes a marker, so no sequence is skipped and the gap detector cannot see it — the watchdog is the only thing that catches that case, which is why its grace period sets how long a lost marker costs.
+
+**Why frames are lost.** Capturing the frames the board rejects (`DUMP_BAD_FRAMES` in `code.py`) and analysing them offline: 50 of 58 were correctable by flipping exactly one bit, and **100% of those were `0 -> 1`** — a bit that should have been low arrived high, never the reverse. Five more were frames merged by a dropped byte, three had two flipped bits. `len_err` stayed at 0 throughout.
+
+That is a line-level problem, not a parsing one. GPIO2 feeds GPIO1 through the 510 ohm resistor, and sweeping its strength in software (`PULLUP_MODE`) shows the resistor is carrying the signal rather than merely biasing an idle line:
+
+| GPIO2 | effective bias | frames/s | frame error rate |
+|---|---|---|---|
+| driven high | 510 ohm pull-up | 16.4 | 5.4% |
+| input, internal pull-up | ~45k pull-up | 4.7 | 100%, all corrupt |
+| high-Z | none | 0.0 | no frames at all |
+| driven low | 510 ohm pull-down | 0.0 | no frames at all |
+| input, internal pull-down | ~45k pull-down | 0.0 | no frames at all |
+
+So 510 ohm sits at a compromise: strong enough for clean rising edges at 1.2 Mbaud, stiff enough that the driver's lows get lifted toward the input threshold, which is exactly the one-directional error. No software setting escapes it, and `PULLUP_MODE` stays `"strong"`.
+
+**The real fix is hardware.** 510 ohm is an RS-485 fail-safe bias value, and Tx+/Tx- is an RS-485-style differential pair — this board taps one leg of it single-ended, discarding the common-mode rejection the pair exists to provide. A 3.3V transceiver (MAX3485, SP3485, SN65HVD75) across Tx+/Tx- with RO into GPIO1, DE and RE tied low so it only receives, gives proper differential thresholds and should remove this error class; the 510 ohm and GPIO2 would then come out. That matters more for laser power than for markers, since power commands ride the same frames and a dropped one leaves the laser at its previous setting.
 
 
 ## Head position tracking
