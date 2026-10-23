@@ -62,6 +62,29 @@ lost.clear()
 feed('MARK 1 209 10 1\n')
 check("not treated as loss", lost == [] and link.status()['gap_count'] == 1, str(lost))
 
+print("\nbus health is read from the board's status line")
+feed('[status] ok=100 crc_err=2 len_err=0 buf=0 servo_gap=3ms marks=1/0/0 '
+     'fixed=0/0 orphan=0/0 host=up\n')
+time.sleep(1.1)
+feed('[status] ok=116 crc_err=2 len_err=0 buf=0 servo_gap=3ms marks=1/0/0 '
+     'fixed=0/0 orphan=0/0 host=up\n')
+st = link.status()
+check("bus reported alive when frames are flowing", st['bus_alive'] is True,
+      str({k: st.get(k) for k in ('bus_alive', 'bus_fps')}))
+check("frame rate measured", (st['bus_fps'] or 0) > 1.0, str(st.get('bus_fps')))
+
+feed('[status] ok=116 crc_err=2 len_err=0 buf=0 servo_gap=3ms marks=1/0/0 '
+     'fixed=0/0 orphan=2767/1 host=up\n')
+time.sleep(1.1)
+feed('[status] ok=116 crc_err=2 len_err=0 buf=0 servo_gap=3ms marks=1/0/0 '
+     'fixed=0/0 orphan=2767/1 host=up\n')
+st = link.status()
+check("bus reported dead when ok stops climbing", st['bus_alive'] is False,
+      str({k: st.get(k) for k in ('bus_alive', 'bus_fps')}))
+check("and says what to check", 'signal wire' in (st.get('bus_error') or ''),
+      str(st.get('bus_error')))
+check("orphan bytes surfaced", st.get('orphan_bytes') == 2767, str(st.get('orphan_bytes')))
+
 print("\nport loss reports loss and keeps the reader alive for reconnect")
 lost.clear()
 os.close(master); os.close(slave)

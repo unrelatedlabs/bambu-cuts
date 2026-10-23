@@ -326,11 +326,20 @@ def crc16_ccitt_0x1021(data: bytes, init: int = 0x913D) -> int:
 REPAIR_FRAMES = True
 REPAIR_MAX_BITS = 8 * 40
 
-# A repaired frame is only ever accepted when it decodes into the marker
-# range. Searching until some candidate passes CRC is a good way to
-# manufacture a plausible wrong value, and a wrong laser power is a safety
-# problem where a wrong done marker is not: the host's timestamp guard
-# rejects a stale marker, and a spurious one at worst completes a job early.
+# Whether a repaired frame may carry a power command as well as a marker.
+#
+# Searching 240 candidates until one passes a 16-bit CRC accepts a wrong
+# value roughly 0.4% of the time, so this is a trade rather than free. For
+# the UV curing light this board drives, the alternative is worse: a dropped
+# command leaves the light at its PREVIOUS setting, so a lost "off" overcures
+# the part. Right 99.6% of the time beats right never.
+#
+# Set this False if a cutting laser is ever fitted in place of the UV light.
+# Then a wrong power is a safety problem rather than a quality one, and
+# markers alone stay repairable - a spurious one at worst completes a job
+# early, and the host's timestamp guard rejects a stale one.
+REPAIR_POWER_COMMANDS = True
+
 repairs_ok = 0
 repairs_rejected = 0
 
@@ -367,7 +376,10 @@ def repair_frame(buf, L, crc_calc, crc_seen):
     if crc16_ccitt_0x1021(bytes(out[0:region_len])) != (out[L - 2] | (out[L - 1] << 8)):
         return None
     payload = bytes(out[5:region_len])
-    if len(payload) < 3 or payload[0] * 4 + payload[1] < MARKER_MIN:
+    if len(payload) < 3:
+        repairs_rejected += 1
+        return None
+    if payload[0] * 4 + payload[1] < MARKER_MIN and not REPAIR_POWER_COMMANDS:
         repairs_rejected += 1
         return None
     repairs_ok += 1

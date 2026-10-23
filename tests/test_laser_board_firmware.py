@@ -208,14 +208,25 @@ two = bytearray(good); two[7] ^= 0x04; two[9] ^= 0x10   # two flipped bits
 check("two-bit corruption is not repaired", not process_frame(two))
 
 clear()
-laser = build_frame(150, 0)                             # a real laser power command
-bad_laser = bytearray(laser); bad_laser[7] ^= 0x08
-before_rej = ns["repairs_rejected"]
-check("corrupted laser power is NOT repaired", not process_frame(bad_laser))
-check("and the rejection is counted", ns["repairs_rejected"] == before_rej + 1,
-      str(ns["repairs_rejected"]))
-check("laser untouched by a rejected repair", pwm.duty_cycle == pwm_before,
-      f"{pwm_before} -> {pwm.duty_cycle}")
+power = build_frame(150, 0)                             # a real power command
+bad_power = bytearray(power); bad_power[7] ^= 0x08
+if ns["REPAIR_POWER_COMMANDS"]:
+    check("corrupted power command is repaired (UV light: dose beats nothing)",
+          process_frame(bad_power))
+    check("and the repaired power is applied",
+          pwm.duty_cycle == int(150 * 0xFFFF // 200), str(pwm.duty_cycle))
+else:
+    before_rej = ns["repairs_rejected"]
+    check("corrupted power is NOT repaired", not process_frame(bad_power))
+    check("and the rejection is counted", ns["repairs_rejected"] == before_rej + 1,
+          str(ns["repairs_rejected"]))
+    check("output untouched by a rejected repair", pwm.duty_cycle == pwm_before,
+          f"{pwm_before} -> {pwm.duty_cycle}")
+
+clear()
+short = build_frame(150, 0)[:8]                         # too short to decode
+check("a frame too short to decode is never repaired",
+      ns["repair_frame"](bytearray(short), 13, 1, 2) is None)
 
 clear()
 print("\n" + ("FAILURES: " + ", ".join(fail) if fail else "all firmware checks passed"))

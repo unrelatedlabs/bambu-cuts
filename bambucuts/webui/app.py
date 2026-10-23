@@ -165,12 +165,20 @@ def stop_marker_link():
 
 
 def marker_link_status():
-    """Side channel status for the status endpoint, trimmed for a 1 Hz poll."""
+    """Side channel status for the status endpoint, trimmed for a 1 Hz poll.
+
+    Reports bus health separately from port health: a board that is plugged
+    in and talking but seeing no AMS-Lite frames looks identical to "no
+    markers arrived" from the host's side, and silently degrades to the MQTT
+    fallback. Saying so is the difference between a slow job and a puzzle.
+    """
     if marker_link is None:
         return {'enabled': False, 'connected': False, 'device': None,
                 'error': 'Marker side channel not started', 'marker_count': 0}
     status = marker_link.status()
     status.pop('log', None)
+    if status.get('connected') and status.get('bus_alive') is False:
+        status['error'] = status.get('bus_error') or status.get('error')
     return status
 
 

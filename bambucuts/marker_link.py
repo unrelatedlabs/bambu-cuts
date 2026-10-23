@@ -33,6 +33,7 @@ timestamped, since the two clocks share no origin.
 """
 
 import glob
+import re
 import threading
 import time
 
@@ -48,6 +49,18 @@ READ_TIMEOUT = 0.2
 
 # Recent markers kept for the status endpoint.
 MARKER_LOG_LIMIT = 50
+
+# The board's once-a-second status line. Parsed for bus health: a board that
+# is connected and chatty but seeing no frames means the AMS-Lite tap is
+# dead, which otherwise looks exactly like "no markers arrived" and quietly
+# degrades to the MQTT fallback with nothing to say about why.
+STATUS_RE = re.compile(
+    r'\[status\] ok=(?P<ok>\d+) crc_err=(?P<crc>\d+) len_err=(?P<len>\d+).*?'
+    r'orphan=(?P<orphan>\d+)/(?P<runs>\d+)')
+
+# Frames per second below which the bus counts as silent. The printer polls
+# the AMS continuously, so a healthy tap sees double figures.
+BUS_QUIET_FPS = 1.0
 
 # Where to look for the board when no device is configured. The board has a
 # single CDC interface - the ESP32-S2 has too few USB endpoints to add a
@@ -131,8 +144,14 @@ class MarkerLink:
             'last_seq': None,
             'gap_count': 0,
             'lost_estimate': 0,
+            'bus_fps': None,
+            'bus_alive': None,
+            'bus_error': None,
+            'crc_fps': None,
+            'orphan_bytes': None,
             'log': [],
         }
+        self._last_status = None
 
     # ----- control -----
 
@@ -208,6 +227,31 @@ class MarkerLink:
             if len(log) > MARKER_LOG_LIMIT:
                 del log[:len(log) - MARKER_LOG_LIMIT]
 
+    def _note_board_status(self, line):
+        """Track bus health from the board's status line."""
+        m = STATUS_RE.search(line)
+        if not m:
+            return
+        now = time.time()
+        ok, crc = int(m.group('ok')), int(m.group('crc'))
+        prev = self._last_status
+        self._last_status = (now, ok, crc)
+        if not prev or now <= prev[0]:
+            return
+        dt = now - prev[0]
+        if dt < 0.2 or ok < prev[1]:        # board restarted; counters reset
+            return
+        fps = (ok - prev[1]) / dt
+        crc_fps = (crc - prev[2]) / dt
+        alive = fps >= BUS_QUIET_FPS
+        error = None
+        if not alive:
+            error = ('Laser board sees no AMS-Lite traffic '
+                     f'({fps:.1f} frames/s): check the signal wire and connector')
+        self._set(bus_fps=round(fps, 1), crc_fps=round(crc_fps, 2),
+                  bus_alive=alive, bus_error=error,
+                  orphan_bytes=int(m.group('orphan')))
+
     def _open(self):
         """Open the board's port, or return None with the reason recorded."""
         try:
@@ -250,6 +294,7 @@ class MarkerLink:
                 continue
             marker = parse_marker(line)
             if marker is None:
+                self._note_board_status(line)
                 continue
             at = time.time()
             gap = self._check_sequence(marker)
