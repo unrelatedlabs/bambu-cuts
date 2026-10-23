@@ -22,6 +22,7 @@ import threading
 import base64
 import math
 import statistics
+import itertools
 import uuid
 from io import BytesIO
 
@@ -119,19 +120,10 @@ direct_job_lock = threading.Lock()
 def _handle_marker(address, value, at):
     """Called from the marker reader thread for every marker the board sends.
 
-    Observe only for now: it logs when the marker arrived relative to the
-    oldest in-flight job, which is the measurement that says what the side
-    channel is worth against the 1-2s the MQTT progress report costs. Job
-    completion still runs off the MQTT marker.
-
-    Kept cheap on purpose: this runs on the reader thread, which must get
-    back to the port promptly, and work here delays the next marker.
+    Kept to one call on purpose: this runs on the reader thread, which must
+    get back to the port promptly, and work here delays the next marker.
     """
-    with direct_job_lock:
-        active = _active_direct_jobs()
-        queued_at = active[0].get('queued_at') if active else None
-    since = f"+{at - queued_at:.3f}s after queue" if queued_at else "no job in flight"
-    print(f"Marker {value} on address {address}: {since}")
+    update_direct_job_from_marker(value, at, address=address)
 
 
 def start_marker_link():
@@ -745,10 +737,49 @@ def direct_job_timeout_seconds(estimated_seconds: float) -> float:
     return max(DIRECT_JOB_MIN_TIMEOUT_SECONDS, estimated_seconds * DIRECT_JOB_TIMEOUT_FACTOR)
 
 
-# The done marker is `M73 P<n> R0`. The printer echoes it as mc_percent in
-# its MQTT status report, and mc_remaining_time 0 tells it apart from a real
-# print's progress. The M400 before it (when used) drains queued motion first.
+# Every tracked batch ends in a done marker, and a job completes when one
+# comes back. Two markers are appended, and whichever arrives first wins.
+#
+# The MQTT marker is `M73 P<n> R0`: the printer echoes it as mc_percent in
+# its status report, and mc_remaining_time 0 tells it apart from a real
+# print's progress. It always works, and it is slow - the printer's snapshot
+# picks up an executed M73 one to two seconds late.
+#
+# The side-channel marker is `M620 R<code> M621 R<code>`, which reaches the
+# laser board over the AMS-Lite bus and comes back over USB in milliseconds
+# (see bambucuts/marker_link.py). Codes run from SIDE_MARKER_MIN up, above
+# the 0-200 the board reads as a real servo angle, so the board can tell
+# them apart and leave its outputs alone. It is only appended when the board
+# is actually connected, and the MQTT marker remains as the fallback, so an
+# absent or wedged board costs latency and never correctness.
+#
+# The M400 before both (when used) drains queued motion first.
 MARKER_FIELD = 'mc_percent'
+SIDE_MARKER_MIN = 201
+SIDE_MARKER_MAX = 251
+_side_marker_counter = itertools.count()
+
+
+def next_side_marker() -> int:
+    """Next side-channel marker code, cycling SIDE_MARKER_MIN..MAX.
+
+    Monotonic by construction, so queued batches get codes in order. A code
+    only comes back around after the whole range, and the matcher also
+    requires a marker to post-date the job it completes, so a stale code
+    still on the wire cannot resolve a later job.
+    """
+    span = SIDE_MARKER_MAX - SIDE_MARKER_MIN + 1
+    return SIDE_MARKER_MIN + next(_side_marker_counter) % span
+
+
+def side_channel_ready() -> bool:
+    """Whether the laser board is readable right now.
+
+    Checked per batch rather than once at startup: the board resets when its
+    code.py is saved and can be unplugged mid-session. When it is away there
+    is no point emitting the extra M620, so the batch carries only M73.
+    """
+    return bool(marker_link is not None and marker_link.status().get('connected'))
 
 
 def next_marker_percent() -> int:
@@ -771,12 +802,15 @@ def next_marker_percent() -> int:
 
 
 def add_completion_marker(gcode_text: str, wait_for_motion: bool = True):
-    """Append one done-marker line (with M400 first by default) after the last line.
+    """Append the done markers (with M400 first by default) after the last line.
 
-    The M400 drains queued motion, so the printer echoing the marker over
-    MQTT means every move before it has finished. With wait_for_motion off
-    the marker fires when the parser reaches it, a few moves ahead of the
-    pen, which keeps motion continuous when another batch is queued behind.
+    The M400 drains queued motion, so a marker coming back means every move
+    before it has finished. With wait_for_motion off the markers fire when
+    the parser reaches them, a few moves ahead of the pen, which keeps
+    motion continuous when another batch is queued behind.
+
+    The side-channel marker goes first so it is not held up behind the M73,
+    and is omitted when the laser board is not connected.
     """
     total_commands = sum(1 for _ in extract_executable_gcode(gcode_text))
     if total_commands == 0:
@@ -785,6 +819,9 @@ def add_completion_marker(gcode_text: str, wait_for_motion: bool = True):
             'command_count': 0,
             'marker_field': MARKER_FIELD,
             'marker_value': None,
+            'side_marker_value': None,
+            'side_marker_line': None,
+            'marker_lines': [],
             'wait_for_motion': wait_for_motion,
             'estimated_seconds': 0.0,
             'timeout_seconds': 0.0,
@@ -792,10 +829,15 @@ def add_completion_marker(gcode_text: str, wait_for_motion: bool = True):
 
     percent = next_marker_percent()
     marker_line = f"M73 P{percent} R0"
+    side_code = next_side_marker() if side_channel_ready() else None
+    side_line = f"M620 R{side_code} M621 R{side_code}" if side_code is not None else None
+
     estimated_seconds = estimate_gcode_seconds(gcode_text)
     marker_lines = [f"; bambucuts done marker: {total_commands} command(s)"]
     if wait_for_motion:
         marker_lines.append("M400 ; wait for queued motion to finish")
+    if side_line:
+        marker_lines.append(f"{side_line} ; laser board done marker")
     marker_lines.append(marker_line)
     return '\n'.join([gcode_text.rstrip('\n'), *marker_lines]), {
         'enabled': True,
@@ -803,6 +845,11 @@ def add_completion_marker(gcode_text: str, wait_for_motion: bool = True):
         'marker_line': marker_line,
         'marker_field': MARKER_FIELD,
         'marker_value': str(percent),
+        'side_marker_value': str(side_code) if side_code is not None else None,
+        'side_marker_line': side_line,
+        # The executable marker lines, so the send path can tell them from
+        # the user's own G-code without matching on command prefixes.
+        'marker_lines': [c for c in (strip_inline_comment(l) for l in marker_lines) if c],
         'wait_for_motion': wait_for_motion,
         'estimated_seconds': round(estimated_seconds, 1),
         'timeout_seconds': round(direct_job_timeout_seconds(estimated_seconds), 1),
@@ -854,6 +901,8 @@ def begin_direct_job(progress_info):
         'marker_line': progress_info.get('marker_line'),
         'marker_field': progress_info.get('marker_field', MARKER_FIELD),
         'marker_value': progress_info.get('marker_value'),
+        'side_marker_value': progress_info.get('side_marker_value'),
+        'side_marker_line': progress_info.get('side_marker_line'),
         'wait_for_motion': progress_info.get('wait_for_motion', True),
         'estimated_seconds': progress_info.get('estimated_seconds', 0.0),
         'timeout_seconds': progress_info.get('timeout_seconds', DIRECT_JOB_MIN_TIMEOUT_SECONDS),
@@ -863,9 +912,11 @@ def begin_direct_job(progress_info):
         'message': 'Queueing G-code and waiting for the done marker',
     }
 
+    side = (f", side marker '{job['side_marker_line']}' expecting {job['side_marker_value']}"
+            if job['side_marker_value'] else ", no side marker (laser board not connected)")
     print(f"Direct job {job['id']} started: {job['command_count']} command(s), "
-          f"marker '{job['marker_line']}' expecting {job['marker_field']}={job['marker_value']}, "
-          f"estimated {job['estimated_seconds']}s, timeout {job['timeout_seconds']}s")
+          f"marker '{job['marker_line']}' expecting {job['marker_field']}={job['marker_value']}"
+          f"{side}, estimated {job['estimated_seconds']}s, timeout {job['timeout_seconds']}s")
 
     with direct_job_lock:
         in_flight = _active_direct_jobs()
@@ -945,6 +996,46 @@ def _stall_check_all(mqtt_progress):
     return dict(state.get('direct_job') or {})
 
 
+def _find_marker_job(active, value, at, field):
+    """Index of the in-flight job waiting for this marker, or None.
+
+    The timestamp guard rejects a marker older than the job it would
+    complete. That matters most on the side channel, where codes cycle
+    through a small range and nothing else separates a stale marker still
+    on the wire from the one this job is waiting for.
+    """
+    return next((i for i, j in enumerate(active)
+                 if str(value) == str(j.get(field))
+                 and at >= j.get('started_at', 0)), None)
+
+
+def _complete_matched_jobs(active, matched, at, source, detail, annotate=None):
+    """Complete the matched job and everything queued ahead of it.
+
+    A job cannot execute before the ones queued in front of it, so a marker
+    for job N also proves jobs 0..N-1 ran. Those are completed as inferred,
+    which is what keeps a batch resolvable when the MQTT feed skips its
+    marker entirely at its ~1 Hz cadence. Caller holds direct_job_lock.
+    """
+    for index, job in enumerate(active[:matched + 1]):
+        inferred = index < matched
+        detect_seconds = round(at - job['queued_at'], 3) if job.get('queued_at') else None
+        job['last_update'] = at
+        job['detect_seconds'] = detect_seconds
+        job['detect_inferred'] = inferred
+        job['detect_source'] = source
+        if annotate:
+            annotate(job)
+        _finish_direct_job(
+            job, 'complete',
+            'Completed (inferred from a later checkpoint)' if inferred
+            else f'Direct G-code execution reached the final done marker ({source})',
+            completed_at=at)
+        head.commit(job['id'], at=at)
+        print(f"Final checkpoint reached for job {job['id'][:8]}: {detail} at +{detect_seconds}s "
+              f"after queue{' (inferred)' if inferred else ''}, via {source}. Done.")
+
+
 def update_direct_job_from_mqtt(mqtt_progress):
     """Resolve in-flight direct jobs against the latest cached MQTT report."""
     with direct_job_lock:
@@ -965,38 +1056,53 @@ def update_direct_job_from_mqtt(mqtt_progress):
             # Our markers always send R0, so a nonzero remaining time is not ours.
             return _stall_check_all(mqtt_progress)
 
-        # Find which in-flight job this report belongs to. Everything queued
-        # before it must already have executed, so complete those too even if
-        # their own report was skipped by the printer's 1 Hz cadence.
-        matched = next((i for i, j in enumerate(active)
-                        if str(reported) == str(j.get('marker_value'))
-                        and progress_update >= j.get('started_at', 0)), None)
+        matched = _find_marker_job(active, reported, progress_update, 'marker_value')
         if matched is None:
             return _stall_check_all(mqtt_progress)
 
         meta = mqtt_progress.get('report_meta') or {}
-        for index, job in enumerate(active[:matched + 1]):
-            inferred = index < matched
-            detect_seconds = round(progress_update - job['queued_at'], 3) if job.get('queued_at') else None
+
+        def annotate(job):
             job['last_percent'] = percent
             job['last_remaining_time'] = remaining_time
-            job['last_update'] = progress_update
-            job['detect_seconds'] = detect_seconds
-            job['detect_inferred'] = inferred
             job['detect_report_kind'] = 'pushall' if meta.get('pushall_matched') else 'delta'
             job['detect_pushall_rtt'] = round(meta['pushall_rtt'], 3) if meta.get('pushall_rtt') is not None else None
             job['detect_since_pushall'] = round(meta['since_last_pushall'], 3) if meta.get('since_last_pushall') is not None else None
             job['pushalls_sent'] = max(0, meta.get('pushall_count', 0) - job.get('pushalls_at_queue', 0))
-            _finish_direct_job(
-                job, 'complete',
-                'Completed (inferred from a later checkpoint)' if inferred
-                else 'Direct G-code execution reached the final done marker',
-                completed_at=progress_update)
-            head.commit(job['id'], at=progress_update)
-            print(f"Final checkpoint reached for job {job['id'][:8]}: {field}={reported} at +{detect_seconds}s "
-                  f"after queue{' (inferred)' if inferred else ''}, via {job['detect_report_kind']}, "
-                  f"{job['pushalls_sent']} pushalls sent during job. Done.")
 
+        _complete_matched_jobs(active, matched, progress_update, 'mqtt',
+                               f"{field}={reported}", annotate=annotate)
+        return dict(state.get('direct_job') or {})
+
+
+def update_direct_job_from_marker(value, at, address=None):
+    """Resolve in-flight direct jobs against a marker read off the laser board.
+
+    This is the fast path: the board decodes the M620 within a millisecond
+    of the printer executing it, against the one to two seconds the MQTT
+    snapshot takes to pick up an M73. Nothing here is required for
+    correctness - every job also carries an MQTT marker - so an unmatched
+    marker is logged and dropped rather than treated as an error.
+    """
+    with direct_job_lock:
+        active = _active_direct_jobs()
+        if not active:
+            return dict(state.get('direct_job') or {})
+
+        matched = _find_marker_job(active, value, at, 'side_marker_value')
+        if matched is None:
+            # Worth a line rather than silence. The likeliest cause is the
+            # printer encoding `M620 R<n>` as something other than the n we
+            # wrote, which shows up here as a marker whose value no job
+            # expects. The job still completes on its MQTT marker, so the
+            # symptom is lost speed, not a stuck job.
+            expected = [j.get('side_marker_value') for j in active]
+            print(f"Marker {value} (address {address}) matches no in-flight job, "
+                  f"which expect {expected}; falling back to the MQTT marker")
+            return dict(state.get('direct_job') or {})
+
+        _complete_matched_jobs(active, matched, at, 'side-channel',
+                               f"laser board marker {value}")
         return dict(state.get('direct_job') or {})
 
 
@@ -1612,6 +1718,10 @@ def queue_direct_gcode(gcode_text: str, single_call: bool = False, progress_mark
 
     executable_lines = list(extract_executable_gcode(gcode_to_send))
     payload_bytes = 0
+    # Which of the lines about to be queued are our own done markers. Matched
+    # exactly, not by command prefix: the side-channel marker is an M620, and
+    # the user's G-code legitimately contains M620s of its own for the laser.
+    marker_lines = set(progress_info.get('marker_lines') or ())
 
     if single_call:
         # Ship every line in a single MQTT gcode_line command instead of one
@@ -1621,8 +1731,7 @@ def queue_direct_gcode(gcode_text: str, single_call: bool = False, progress_mark
             add_to_history(line)
 
         queued_count = len(lines)
-        sent_count = sum(
-            1 for line in lines if not line.upper().startswith(('M73', 'M400')))
+        sent_count = sum(1 for line in lines if line not in marker_lines)
         payload_bytes = len('\n'.join(lines).encode('utf-8'))
 
         if state['printer_connected']:
@@ -1640,7 +1749,7 @@ def queue_direct_gcode(gcode_text: str, single_call: bool = False, progress_mark
                     errors.append(f"Line {line_num}: Failed to send")
 
             queued_count += 1
-            if not line.upper().startswith(('M73', 'M400')):
+            if line not in marker_lines:
                 sent_count += 1
             time.sleep(0.05)  # Small delay between commands
 
@@ -1803,6 +1912,7 @@ def _benchmark_one(gcode_text: str, single_call: bool, stop_event):
         'total_seconds': round(t_done - t_send, 3),
         'estimated_motion_seconds': result['progress'].get('estimated_seconds'),
         'detect_seconds': job.get('detect_seconds'),
+        'detect_source': job.get('detect_source'),
         'detect_report_kind': job.get('detect_report_kind'),
         'detect_pushall_rtt': job.get('detect_pushall_rtt'),
         'detect_since_pushall': job.get('detect_since_pushall'),
