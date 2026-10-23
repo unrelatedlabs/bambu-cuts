@@ -392,6 +392,14 @@ That is a line-level problem, not a parsing one. GPIO2 feeds GPIO1 through the 5
 
 So 510 ohm sits at a compromise: strong enough for clean rising edges at 1.2 Mbaud, stiff enough that the driver's lows get lifted toward the input threshold, which is exactly the one-directional error. No software setting escapes it, and `PULLUP_MODE` stays `"strong"`.
 
+**Where a lost marker actually goes.** Measured end to end, the chain is:
+
+1. The printer accepts the command and acks it `success` in 26 ms median. Over 400 batches, 8 of the 9 misses were explicitly acked `success` - the ninth fell in an observation gap, at the same rate as the delivered batches - so nothing is lost upstream of the bus.
+2. The frame goes out on the AMS-Lite pair and is corrupted there. Over 260 batches, a window containing a missed marker carried 1.29 unrepairable CRC errors against 0.25 when the marker arrived (86% of miss windows versus 23%), and 7.71 orphan bytes against 2.93.
+3. The board therefore never decodes it. When the corruption lands on the length or start byte the frame never forms at all, which is why a capture of rejected frames contains no missed markers: those bytes leave as orphans instead.
+
+So the loss is entirely physical-layer, downstream of the printer and upstream of the parser. That is why no amount of repeating, repairing or reparsing has moved it, and why the transceiver below is the fix rather than a nicety.
+
 **The real fix is hardware.** 510 ohm is an RS-485 fail-safe bias value, and Tx+/Tx- is an RS-485-style differential pair — this board taps one leg of it single-ended, discarding the common-mode rejection the pair exists to provide. A 3.3V transceiver (MAX3485, SP3485, SN65HVD75) across Tx+/Tx- with RO into GPIO1, DE and RE tied low so it only receives, gives proper differential thresholds and should remove this error class; the 510 ohm and GPIO2 would then come out. That matters more for laser power than for markers, since power commands ride the same frames and a dropped one leaves the laser at its previous setting.
 
 
