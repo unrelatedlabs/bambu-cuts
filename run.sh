@@ -1,5 +1,18 @@
 #!/bin/bash
 # Quick run script for Bambu Cuts server
+#
+# Usage:
+#   ./run.sh                       # default profile, port 5425
+#   ./run.sh mini                  # profile "mini", its own port (5426 for the
+#                                  #   second profile) or the one in its config
+#   ./run.sh mini 5500             # profile "mini" on a port you pick
+#
+# One instance per printer: run this in two terminals with two profiles.
+
+set -e
+
+PROFILE="${1:-}"
+PORT="${2:-}"
 
 echo "🚀 Starting Bambu Cuts Server..."
 
@@ -18,6 +31,10 @@ if ! python -c "import flask" 2>/dev/null; then
     pip install -r requirements.txt
 fi
 
-# Run the server
-echo "✂️ Bambu Cuts starting at http://localhost:5425"
-python -m bambucuts.webui.app
+ARGS=()
+if [ -n "$PROFILE" ]; then ARGS+=(--profile "$PROFILE"); fi
+if [ -n "$PORT" ]; then ARGS+=(--port "$PORT"); fi
+
+# Run the server (it prints the URL it settled on)
+echo "✂️ Bambu Cuts starting${PROFILE:+ [profile: $PROFILE]}..."
+python -m bambucuts.cli server "${ARGS[@]}"

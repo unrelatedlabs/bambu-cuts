@@ -12,7 +12,9 @@ commit it as the printer confirms execution. The tracker keeps three views:
   time elapsed since it started moving.
 
 The simulator carries the printer's modal state (G90/G91, feed rate) across
-sends, which matters because this app leaves the printer in G91 for jogging.
+sends. That is what lets the app keep the printer in G90 and send even jogs
+as absolute moves, falling back to a relative jog only while ``uncertain``
+says the starting point is not established.
 """
 
 from __future__ import annotations

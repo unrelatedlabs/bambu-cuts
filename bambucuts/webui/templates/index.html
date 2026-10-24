@@ -3,13 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>✂️ Bambu Cuts</title>
-    <link rel="stylesheet" href="/static/style.css?v=4">
+    <title>✂️ Bambu Cuts{% if not is_default_profile %} - {{ instance_name }}{% endif %}</title>
+    <link rel="stylesheet" href="/static/style.css?v=5">
 </head>
 <body>
     <div class="container">
         <header>
             <h1>✂️ Bambu Cuts - Cutter and Plotter ✂️</h1>
+            {% if not is_default_profile %}<p class="instance-badge">{{ instance_name }}</p>{% endif %}
         </header>
 
         <!-- Connection Status & Configuration -->
@@ -34,6 +35,10 @@
                     <div class="config-field">
                         <label>Access Code:</label>
                         <input type="text" id="printerAccessCode" placeholder="Access Code" value="">
+                    </div>
+                    <div class="config-field">
+                        <label>Name:</label>
+                        <input type="text" id="printerName" placeholder="Shown in the title bar" value="">
                     </div>
                     <button id="saveConfigBtn" class="btn btn-secondary">Save Config</button>
                 </div>
@@ -258,6 +263,6 @@ G1 X50 Y50 F1000  ; Move to position"></textarea>
         </div>
     </div>
 
-    <script src="/static/app.js?v=5"></script>
+    <script src="/static/app.js?v=6"></script>
 </body>
 </html>

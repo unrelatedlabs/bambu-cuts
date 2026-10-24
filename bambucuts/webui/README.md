@@ -103,10 +103,13 @@ http://localhost:5425
 
 ## Configuration
 
-The server runs on `0.0.0.0:5425` by default, making it accessible from other devices on your network. To change:
+The server runs on `0.0.0.0:5425` by default, making it accessible from other
+devices on your network. Every profile past the default one gets the next free
+port up (a second printer serves on 5426), so instances do not collide. To pick
+a port yourself, pass `--port`, or put `port` in the profile's config file:
 
-```python
-app.run(host='localhost', port=8080)  # Local only, different port
+```bash
+bambucuts server --profile mini --port 8080
 ```
 
 ## Security Note

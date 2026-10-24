@@ -1102,6 +1102,7 @@ async function loadConfig() {
         document.getElementById('printerIP').value = data.ip;
         document.getElementById('printerSerial').value = data.serial;
         document.getElementById('printerAccessCode').value = data.access_code;
+        document.getElementById('printerName').value = data.name || '';
        
     } catch (error) {
         console.error('Failed to load config:', error);
@@ -1112,6 +1113,7 @@ async function saveConfig() {
     const ip = document.getElementById('printerIP').value;
     const serial = document.getElementById('printerSerial').value;
     const accessCode = document.getElementById('printerAccessCode').value;
+    const name = document.getElementById('printerName').value;
 
     try {
         const response = await fetch(`${API_BASE}/api/config`, {
@@ -1120,7 +1122,8 @@ async function saveConfig() {
             body: JSON.stringify({
                 ip: ip,
                 serial: serial,
-                access_code: accessCode
+                access_code: accessCode,
+                name: name
             })
         });
 

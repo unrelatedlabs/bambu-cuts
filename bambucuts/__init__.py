@@ -7,13 +7,26 @@ Includes tools for SVG/DXF to G-code conversion and a web-based control interfac
 
 __version__ = "0.1.0"
 
-from .config import load_config, save_config, update_config, get_config
+from .config import (
+    load_config,
+    save_config,
+    update_config,
+    get_config,
+    set_profile,
+    get_profile,
+    list_profiles,
+    config_path,
+)
 
 __all__ = [
     'load_config',
     'save_config',
     'update_config',
     'get_config',
+    'set_profile',
+    'get_profile',
+    'list_profiles',
+    'config_path',
     'GCodeTools',
     'CuttingParameters',
     'convert_dxf_to_svg',

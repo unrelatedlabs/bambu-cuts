@@ -9,14 +9,50 @@ Provides command-line tools for:
 """
 
 import sys
+import json
 import argparse
 from pathlib import Path
 
 
 def cmd_server(args):
     """Start the Bambu Cuts web server."""
+    from bambucuts import config
     from bambucuts.webui import start_server
-    start_server(host=args.host, port=args.port, debug=args.debug)
+
+    # A profile can pin its own host/port, and otherwise gets a port of its own
+    # derived from its name, so each printer's instance only needs
+    # `bambucuts server --profile <name>`.
+    cfg = config.get_config()
+    host = args.host or cfg.get('host') or '0.0.0.0'
+    port = args.port or cfg.get('port') or config.default_port()
+
+    start_server(host=host, port=int(port), debug=args.debug)
+
+
+def cmd_profiles(args):
+    """List the printer profiles that have a config file."""
+    from bambucuts import config
+
+    names = config.list_profiles()
+    if not names:
+        print("No profiles yet. Run 'bambucuts server --profile <name>' to create one.")
+        return
+
+    active = config.profile_label()
+    for name in names:
+        path = config.config_path(None if name == 'default' else name)
+        marker = '*' if name == active else ' '
+        detail = ''
+        try:
+            with open(path) as f:
+                cfg = json.load(f)
+            detail = f"  {cfg.get('ip', '?')}"
+            profile = None if name == 'default' else name
+            port = cfg.get('port') or config.default_port(profile)
+            detail += f"  port {port}"
+        except Exception:
+            detail = '  (unreadable)'
+        print(f"{marker} {name}{detail}  [{path}]")
 
 
 def cmd_svg2gcode(args):
@@ -164,17 +200,33 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
+    # --profile is accepted both before and after the subcommand. SUPPRESS keeps
+    # the unused copy from clobbering the one the user actually typed.
+    profile_parent = argparse.ArgumentParser(add_help=False)
+    profile_parent.add_argument('--profile', default=argparse.SUPPRESS,
+                                help='Printer profile to use, one per printer '
+                                     '(default: $BAMBUCUTS_PROFILE, else the default profile)')
+    parser.add_argument('--profile', default=argparse.SUPPRESS,
+                        help='Printer profile to use, one per printer '
+                             '(default: $BAMBUCUTS_PROFILE, else the default profile)')
+
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
     # Server command
-    server_parser = subparsers.add_parser('server', help='Start the web server')
-    server_parser.add_argument('--host', default='0.0.0.0', help='Host to bind to (default: 0.0.0.0)')
-    server_parser.add_argument('--port', type=int, default=5425, help='Port to bind to (default: 5425)')
+    server_parser = subparsers.add_parser('server', help='Start the web server', parents=[profile_parent])
+    server_parser.add_argument('--host', default=None, help='Host to bind to (default: 0.0.0.0)')
+    server_parser.add_argument('--port', type=int, default=None,
+                               help="Port to bind to (default: the profile's 'port', else "
+                                    "5425 for the default profile and one port up per extra profile)")
     server_parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     server_parser.set_defaults(func=cmd_server)
 
+    # Profiles command
+    profiles_parser = subparsers.add_parser('profiles', help='List configured printer profiles', parents=[profile_parent])
+    profiles_parser.set_defaults(func=cmd_profiles)
+
     # SVG to G-code command
-    svg2gcode_parser = subparsers.add_parser('svg2gcode', help='Convert SVG to G-code')
+    svg2gcode_parser = subparsers.add_parser('svg2gcode', help='Convert SVG to G-code', parents=[profile_parent])
     svg2gcode_parser.add_argument('input', help='Input SVG file')
     svg2gcode_parser.add_argument('-o', '--output', help='Output G-code file (default: input.gcode)')
     svg2gcode_parser.add_argument('--tool-diameter', type=float, default=0.4, help='Tool diameter in mm (default: 0.4)')
@@ -185,13 +237,13 @@ def main():
     svg2gcode_parser.set_defaults(func=cmd_svg2gcode)
 
     # DXF to SVG command
-    dxf2svg_parser = subparsers.add_parser('dxf2svg', help='Convert DXF to SVG')
+    dxf2svg_parser = subparsers.add_parser('dxf2svg', help='Convert DXF to SVG', parents=[profile_parent])
     dxf2svg_parser.add_argument('input', help='Input DXF file')
     dxf2svg_parser.add_argument('-o', '--output', help='Output SVG file (default: input.svg)')
     dxf2svg_parser.set_defaults(func=cmd_dxf2svg)
 
     # MQTT dump command
-    mqtt_dump_parser = subparsers.add_parser('mqtt-dump', help='Dump raw Bambu MQTT report messages')
+    mqtt_dump_parser = subparsers.add_parser('mqtt-dump', help='Dump raw Bambu MQTT report messages', parents=[profile_parent])
     mqtt_dump_parser.add_argument('--ip', help='Printer IP address (default: configured printer IP)')
     mqtt_dump_parser.add_argument('--serial', help='Printer serial number (default: configured serial)')
     mqtt_dump_parser.add_argument('--access-code', help='Printer LAN access code (default: configured access code)')
@@ -207,6 +259,16 @@ def main():
 
     # Parse arguments
     args = parser.parse_args()
+
+    # Select the profile before anything reads (or prompts for) printer details.
+    profile = getattr(args, 'profile', None)
+    if profile is not None:
+        from bambucuts import config
+        try:
+            config.set_profile(profile)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(2)
 
     if not args.command:
         parser.print_help()
