@@ -151,10 +151,10 @@
                 <section class="gcode-section">
                     <h2>⌨️ Manual G-code Input</h2>
                     <div class="gcode-input-container">
-                        <input type="text" id="gcodeInput" placeholder="Enter G-code command (e.g., G1 X10 Y20)">
+                        <textarea id="gcodeInput" rows="4" spellcheck="false" placeholder="Enter G-code, one command per line (e.g., G1 X10 Y20)"></textarea>
                         <button class="btn btn-primary" id="sendGcode">Send</button>
                     </div>
-                    <div class="gcode-mode-note">G90 = absolute positioning. G91 = relative positioning.</div>
+                    <div class="gcode-mode-note">Ctrl+Enter (⌘+Enter) sends. G90 = absolute positioning. G91 = relative positioning.</div>
                 </section>
 
                 <!-- Laser Section -->

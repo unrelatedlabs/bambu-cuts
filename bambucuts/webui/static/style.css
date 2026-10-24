@@ -804,10 +804,14 @@ header h1 {
 
 .gcode-input-container {
     display: flex;
+    align-items: flex-start;
     gap: 10px;
 }
 
-.gcode-input-container input {
+.gcode-input-container textarea {
+    min-width: 0;
+    resize: vertical;
+    line-height: 1.4;
     flex: 1;
     padding: 12px;
     background: var(--bg-tertiary);
@@ -818,12 +822,12 @@ header h1 {
     font-family: 'Courier New', monospace;
 }
 
-.gcode-input-container input:focus {
+.gcode-input-container textarea:focus {
     outline: none;
     border-color: var(--accent-primary);
 }
 
-.gcode-input-container input::placeholder {
+.gcode-input-container textarea::placeholder {
     color: var(--text-secondary);
 }
 

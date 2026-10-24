@@ -735,9 +735,15 @@ def add_to_history(gcode: str):
 # unaware of this rig, rather than every post-processor needing a custom
 # profile.
 #
-#   M3 S<power> / M4 S<power>  ->  M620 P<v> M621 P<v>
-#   M5                         ->  M620 P0 M621 P0
-#   M280 P<index> S<angle>     ->  M620 R<angle> M621 R<angle>
+#   M3 S<power> / M4 S<power>  ->  M400, M620 P<v> M621 P<v>
+#   M5                         ->  M400, M620 P0 M621 P0
+#   M280 P<index> S<angle>     ->  M400, M620 R<angle> M621 R<angle>
+#
+# The M400 is required: the printer runs M620 as soon as it parses it, not
+# when the moves ahead of it finish (measured: a marker behind a 3 s move
+# reached the board after 0.2 s without M400, 3.2 s with it). Without the
+# sync, M3 ... moves ... M5 would switch the tool on and off before the
+# moves ran. The head stops briefly at every switch as a result.
 #
 # S is scaled from the tool's range (LASER_S_MAX, 1000 in LightBurn and
 # GRBL by default) onto the board's 0-200. An S already within 0-200 with
@@ -745,6 +751,7 @@ def add_to_history(gcode: str):
 LASER_MAX_POWER = 200
 SERVO_MAX_ANGLE = 180
 LASER_S_MAX_DEFAULT = 1000
+TOOL_SYNC = 'M400'
 
 _WORD = {}
 
@@ -780,10 +787,10 @@ def translate_tool_gcode(gcode_text: str, s_max: float = None):
             # A bare M3 with no S means full power, as in GRBL.
             power = LASER_MAX_POWER if s is None else s / s_max * LASER_MAX_POWER
             power = max(0, min(LASER_MAX_POWER, int(round(power))))
-            out.append(f"{_bus_command('P', power)} ; {code}")
+            out += [TOOL_SYNC, f"{_bus_command('P', power)} ; {code}"]
             counts['laser'] += 1
         elif head in ('M5', 'M05'):
-            out.append(f"{_bus_command('P', 0)} ; {code}")
+            out += [TOOL_SYNC, f"{_bus_command('P', 0)} ; {code}"]
             counts['laser'] += 1
         elif head == 'M280':
             angle = _gcode_word(code, 'S')
@@ -791,7 +798,7 @@ def translate_tool_gcode(gcode_text: str, s_max: float = None):
                 out.append(raw)       # nothing to act on; leave it alone
                 continue
             angle = max(0, min(SERVO_MAX_ANGLE, int(round(angle))))
-            out.append(f"{_bus_command('R', angle)} ; {code}")
+            out += [TOOL_SYNC, f"{_bus_command('R', angle)} ; {code}"]
             counts['servo'] += 1
         else:
             out.append(raw)
@@ -1708,6 +1715,49 @@ def motors_off():
     })
 
 
+ESTOP_COMMANDS = ('stop', 'pause', 'resume')
+
+
+@app.route('/api/estop', methods=['POST'])
+def estop():
+    """Out-of-band printer command: body {"command": "stop"} (default), "pause" or "resume".
+
+    Goes over MQTT as a print command rather than gcode_line, so it should not
+    queue behind G-code already sent. Whether it cancels streamed gcode_line
+    moves is what this endpoint is here to test. It only stops motion: tool
+    state (the UV light, the servo) is left as it is. stop/pause also mark
+    every in-flight direct job aborted.
+    """
+    data = request.get_json(silent=True) or {}
+    command = str(data.get('command', 'stop')).lower()
+    if command not in ESTOP_COMMANDS:
+        return jsonify({'success': False, 'error': f"command must be one of {', '.join(ESTOP_COMMANDS)}"}), 400
+    if not state['printer_connected'] or not printer:
+        return jsonify({'success': False, 'error': 'Printer not connected'}), 503
+
+    sent_at = time.time()
+    try:
+        success = bool(getattr(printer, f'{command}_print')())
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    print(f"E-stop: sent MQTT '{command}' -> {success}")
+
+    aborted = []
+    if command != 'resume':
+        with direct_job_lock:
+            for job in list(_active_direct_jobs()):
+                _finish_direct_job(job, 'aborted', f"Aborted by e-stop ({command})")
+                head.drop(job['id'])
+                aborted.append(job['id'])
+
+    return jsonify({
+        'success': success,
+        'command': command,
+        'sent_at': sent_at,
+        'aborted_jobs': aborted,
+    })
+
+
 @app.route('/api/move-z-absolute', methods=['POST'])
 def move_z_absolute():
     """Move Z to absolute position."""
@@ -1753,6 +1803,8 @@ def execute_gcode():
     if not gcode:
         return jsonify({'success': False, 'error': 'Empty G-code'}), 400
 
+    # Same M3/M5/M280 translation as the direct-send path.
+    gcode, _ = translate_tool_gcode(gcode)
     add_to_history(gcode)
     success = send_tracked(gcode)
 

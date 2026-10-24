@@ -96,8 +96,10 @@ function attachEventListeners() {
 
     // G-code input
     document.getElementById('sendGcode').addEventListener('click', sendCustomGcode);
-    document.getElementById('gcodeInput').addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') {
+    // Enter adds a line; Ctrl/Cmd+Enter sends the whole block.
+    document.getElementById('gcodeInput').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+            e.preventDefault();
             sendCustomGcode();
         }
     });
@@ -665,7 +667,7 @@ async function laserOn() {
         const response = await fetch(`${API_BASE}/api/gcode`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ gcode: 'M620 P1 M621 P1 M400' })
+            body: JSON.stringify({ gcode: 'M400\nM620 P1 M621 P1' })
         });
 
         const data = await response.json();
@@ -692,7 +694,7 @@ async function laserOff() {
         const response = await fetch(`${API_BASE}/api/gcode`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ gcode: 'M620 P0 M621 P0 M400' })
+            body: JSON.stringify({ gcode: 'M400\nM620 P0 M621 P0' })
         });
 
         const data = await response.json();
@@ -722,7 +724,7 @@ async function setLaserPower() {
         const response = await fetch(`${API_BASE}/api/gcode`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ gcode: `M620 P${powerValue} M621 P${powerValue} M400` })
+            body: JSON.stringify({ gcode: `M400\nM620 P${powerValue} M621 P${powerValue}` })
         });
 
         const data = await response.json();

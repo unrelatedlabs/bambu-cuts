@@ -66,39 +66,55 @@ reading.
 
 LightBurn with the attached settings. Or Kiri:Moto (roll your own settings)
 
-## GCODE 
+## Tool control G-code
 
-Laser power range is 0-200 
+Write standard G-code: `M3`/`M5` for the light, `M280` for the servo. The
+bambucuts server translates them into the board's bus commands on the way to
+the printer, on every path (the editor's send, `/api/gcode/send-all`, the
+manual G-code box and `/api/gcode`).
 
-0%
-    M620 P0 M621 P0 M400
+    M3 S<power>              light on; S is 0-1000 (bare M3 = full power)
+    M4 S<power>              same as M3
+    M5                       light off
+    M280 P<index> S<angle>   servo to 0-180 degrees (P is ignored: one servo)
 
-50%
-    M620 P100 M621 P100 M400
+Each one becomes an `M400` followed by the bus command:
 
-100%
-    M620 P200 M621 P200 M400
+    M3 S500       ->  M400
+                      M620 P100 M621 P100 ; M3 S500
+    M280 P0 S90   ->  M400
+                      M620 R90 M621 R90 ; M280 P0 S90
 
+The `M400` matters. The printer runs `M620` the moment it parses it, not when
+the moves ahead of it finish: a command behind a 3 s move reached the board
+0.2 s after sending without `M400`, and 3.2 s with it. The translation adds
+the sync for you, so the head pauses briefly at every switch.
 
-Also issue M400 before turning on/off to complete the move 
+Servo moves are eased in and out over 0.33 s. The light has an auto-off
+watchdog: it switches off 60 s after the last power command, so one `M3`
+holds it for at most a minute. For a longer exposure, repeat the `M3` within
+each minute.
 
-## Servo
+### Switching from direct M620 commands
 
-    M620 R{angle} M621 R{angle} M400
+Replace each hand-written switch, together with its `M400`s, by the standard
+command. The server adds the `M400` before the `M620` itself.
 
-Angle range is 0-180. Moves are eased in and out over 0.33 s.
+| Old (direct)                              | New                 |
+|-------------------------------------------|---------------------|
+| `M400` + `M620 P0 M621 P0`                | `M5`                |
+| `M400` + `M620 P100 M621 P100` (50%)      | `M3 S500`           |
+| `M400` + `M620 P200 M621 P200` (100%)     | `M3 S1000` or `M3`  |
+| `M400` + `M620 P<v> M621 P<v>`            | `M3 S<v x 5>`       |
+| `M400` + `M620 R<angle> M621 R<angle>`    | `M280 P0 S<angle>`  |
 
-## Standard G-code
-
-You do not have to write the bus commands yourself. The web API translates
-the usual tool commands on the way to the printer, so CAM output works as-is:
-
-    M3 S<power>   / M4 S<power>   ->  M620 P<v> M621 P<v>
-    M5                            ->  M620 P0 M621 P0
-    M280 P<index> S<angle>        ->  M620 R<angle> M621 R<angle>
-
-`S` is scaled from the tool's range (1000 by default, as in LightBurn and
-GRBL) onto the board's 0-200.
+- **Power is 0-1000 now**, not 0-200: multiply old `P` values by 5. CAM
+  tools work as-is with a GRBL-style laser profile set to S max 1000.
+- **No `M400` of your own.** Every translated switch gets one in front.
+- **Old files still work** while you move over: hand-written `M620` passes
+  through untouched, but needs its own `M400` *before* it. One after it does
+  not wait for the preceding move.
+- **Avoid 201-251** on either channel: those are completion markers.
 
 ## Completion markers
 
