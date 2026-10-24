@@ -380,17 +380,27 @@ Note that sequence numbers only catch loss *between the board and the host*. A f
 
 **Why frames are lost.** Capturing the frames the board rejects (`DUMP_BAD_FRAMES` in `code.py`) and analysing them offline: 50 of 58 were correctable by flipping exactly one bit, and **100% of those were `0 -> 1`** — a bit that should have been low arrived high, never the reverse. Five more were frames merged by a dropped byte, three had two flipped bits. `len_err` stayed at 0 throughout.
 
-That is a line-level problem, not a parsing one. GPIO2 feeds GPIO1 through the 510 ohm resistor, and sweeping its strength in software (`PULLUP_MODE`) shows the resistor is carrying the signal rather than merely biasing an idle line:
+That is a line-level problem, not a parsing one, and it turned out to be the pull-up. The RX node now has a small bias network, all switchable from software (`BIAS_MODE` in `code.py`):
 
-| GPIO2 | effective bias | frames/s | frame error rate |
-|---|---|---|---|
-| driven high | 510 ohm pull-up | 16.4 | 5.4% |
-| input, internal pull-up | ~45k pull-up | 4.7 | 100%, all corrupt |
-| high-Z | none | 0.0 | no frames at all |
-| driven low | 510 ohm pull-down | 0.0 | no frames at all |
-| input, internal pull-down | ~45k pull-down | 0.0 | no frames at all |
+```
+GPIO4 --2k7-- GPIO2 --510-- node (GPIO1, RX) --2k7-- GPIO3
+```
 
-So 510 ohm sits at a compromise: strong enough for clean rising edges at 1.2 Mbaud, stiff enough that the driver's lows get lifted toward the input threshold, which is exactly the one-directional error. No software setting escapes it, and `PULLUP_MODE` stays `"strong"`.
+Sweeping all 27 combinations of GPIO2/3/4 high, low and floating showed frame corruption rising monotonically with pull-up stiffness:
+
+| pull-up | frame corruption |
+|---|---|
+| 510 ohm (the original, GPIO2 high) | 3 to 7% |
+| 429 ohm and stiffer combinations | up to 10% |
+| ~1.47k (GPIO3 and GPIO4 both high) | 0.70% |
+| **2.7k** (GPIO3 high) | **0 in 7900 frames** |
+| **3.21k** (GPIO4 high, through the 510) | **0 in 5938 frames** |
+| ~45k (the ESP32's internal pull-up) | nothing received |
+| none, or anything pulling GPIO2 low | garbage, or nothing |
+
+The printer's driver drives both levels itself, so the pull-up only needs to hold the line when nothing is driving it. A stiff one fights the driver on every low, which is exactly why every corrupted bit arrived `0 -> 1`. The 2.7k and 3.21k settings tied at zero over a four-round alternating run, so the default is `weak3k2`, chosen for margin: it sits further from the measured failure on the stiff side and nearer the middle of the working range.
+
+An earlier attempt to test a weaker pull-up used only the internal ~45k, which receives nothing, and wrongly concluded that 510 ohm was load-bearing. The working range is in between.
 
 **Where a lost marker actually goes.** Measured end to end, the chain is:
 
@@ -398,10 +408,9 @@ So 510 ohm sits at a compromise: strong enough for clean rising edges at 1.2 Mba
 2. The frame goes out on the AMS-Lite pair and is corrupted there. Over 260 batches, a window containing a missed marker carried 1.29 unrepairable CRC errors against 0.25 when the marker arrived (86% of miss windows versus 23%), and 7.71 orphan bytes against 2.93.
 3. The board therefore never decodes it. When the corruption lands on the length or start byte the frame never forms at all, which is why a capture of rejected frames contains no missed markers: those bytes leave as orphans instead.
 
-So the loss is entirely physical-layer, downstream of the printer and upstream of the parser. That is why no amount of repeating, repairing or reparsing has moved it, and why the transceiver below is the fix rather than a nicety.
+So the loss was entirely physical-layer, downstream of the printer and upstream of the parser - measured with the original 510 ohm pull-up, which is what caused it. That is why no amount of repeating, repairing or reparsing moved it, and why changing the pull-up did.
 
-**The real fix is hardware.** 510 ohm is an RS-485 fail-safe bias value, and Tx+/Tx- is an RS-485-style differential pair — this board taps one leg of it single-ended, discarding the common-mode rejection the pair exists to provide. A 3.3V transceiver (MAX3485, SP3485, SN65HVD75) across Tx+/Tx- with RO into GPIO1, DE and RE tied low so it only receives, gives proper differential thresholds and should remove this error class; the 510 ohm and GPIO2 would then come out. That matters more for laser power than for markers, since power commands ride the same frames and a dropped one leaves the laser at its previous setting.
-
+**A transceiver is no longer required.** 510 ohm is an RS-485 fail-safe bias value and Tx+/Tx- is an RS-485-style pair, so a 3.3V transceiver (MAX3485, SP3485, SN65HVD75) across the pair would still be the textbook receiver, with proper differential thresholds and common-mode rejection. But the measured error class it was meant to remove is gone with the right pull-up alone; it is worth fitting only if the link proves noisy in a different environment.
 
 ## Head position tracking
 

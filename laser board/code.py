@@ -260,34 +260,60 @@ led2a.value=0
 led.value = 1
 
 
-# GPIO2 feeds GPIO1 (UART RX) through the 510 ohm resistor, and so sets the
-# idle level of this single-ended tap off a differential pair. How hard it
-# pulls matters: every corrupted bit observed on this link is 0 -> 1, which
-# is what lows failing to reach the input threshold look like, i.e. a pull-up
-# the bus driver cannot overcome.
+# ===== Bias network on the RX node =====
+# The tap off the AMS-Lite pair is single-ended, so the pull-up on the RX
+# node decides how cleanly the printer's driver can pull it low.
 #
-#   "strong"   - GPIO2 driven high: a stiff 510 ohm pull-up (~6.5 mA)
-#   "weak"     - GPIO2 an input with its internal pull-up, ~45k in series
-#                with the 510 ohm, so a gentle pull-up
-#   "off"      - GPIO2 high-Z: no bias at all
-#   "down"     - GPIO2 driven low: a stiff 510 ohm pull-down, which pulls
-#                lows firmly down at the cost of fighting the highs
-#   "weakdown" - GPIO2 an input with its internal pull-down
+#   GPIO4 --2k7-- GPIO2 --510-- node (GPIO1, RX) --2k7-- GPIO3
 #
-# Measured on this rig: "strong" gives ~5% frame errors, "weak" corrupts
-# every frame and "off" receives nothing at all, so the 510 ohm is carrying
-# the signal level rather than merely biasing an idle line.
-PULLUP_MODE = "strong"
+# Swept on the A1 across all 27 combinations of GPIO2/3/4 high, low and
+# floating: errors rise monotonically with pull-up stiffness. The original
+# 510 ohm pull-up corrupts 3-5% of frames, every corrupted bit a low arriving
+# as a high, and the stiffest combination 10%. A 2k7 or 3k21 pull-up corrupts
+# none at all. The driver drives both levels itself, so the pull-up only has
+# to hold the line when nothing is driving it, and a stiff one just fights
+# the driver's lows. Anything with GPIO2 low pins the line to ground, and no
+# pull-up at all receives only garbage.
+#
+#   mode        pull-up      measured frame corruption
+#   weak3k2     2k7+510      0 in 5938 frames   GPIO4 high through GPIO2's 510
+#   weak2k7     2k7          0 in 7900 frames   GPIO3 high, GPIO2/GPIO4 floating
+#   (1k47)      2k7 || 3k21  0.70%              GPIO3 and GPIO4 both high
+#   stiff       510          3-7%               the original wiring
+#   stiffest    429 || ...   10%                for comparison only
+#
+# The two weak settings tie on errors - a 4-round alternating run put both at
+# zero - so weak3k2 is chosen for margin: the measured failure side is stiff
+# (1k47 already errs) and the dead end is weak (the ~45k internal pull-up
+# receives nothing), and 3k21 sits further from the failure and nearer the
+# middle of that range.
+BIAS_MODE = "weak3k2"
 
-pullup = digitalio.DigitalInOut(microcontroller.pin.GPIO2)
-if PULLUP_MODE in ("strong", "down"):
-    pullup.direction = digitalio.Direction.OUTPUT
-    pullup.value = 1 if PULLUP_MODE == "strong" else 0
-else:
-    pullup.direction = digitalio.Direction.INPUT
-    pullup.pull = (digitalio.Pull.UP if PULLUP_MODE == "weak"
-                   else digitalio.Pull.DOWN if PULLUP_MODE == "weakdown"
-                   else None)
+_BIAS = {
+    #            GPIO2   GPIO3   GPIO4      (1 drive high, 0 drive low, None hi-Z)
+    "weak2k7":  (None,   1,      None),
+    "weak3k2":  (None,   None,   1),
+    "stiff":    (1,      None,   None),
+    "stiffest": (1,      1,      1),
+}
+
+
+def _set_bias_pin(pin, level):
+    io = digitalio.DigitalInOut(pin)
+    if level is None:
+        io.direction = digitalio.Direction.INPUT
+        io.pull = None
+    else:
+        io.direction = digitalio.Direction.OUTPUT
+        io.value = level
+    return io
+
+
+_levels = _BIAS.get(BIAS_MODE, _BIAS["stiff"])
+pullup = _set_bias_pin(microcontroller.pin.GPIO2, _levels[0])
+pulldown = _set_bias_pin(microcontroller.pin.GPIO3, _levels[1])
+pullup_weak = _set_bias_pin(microcontroller.pin.GPIO4, _levels[2])
+
 
 # ===== CRC Helpers (no xor, no reverse) =====
 def crc8_0x39(data: bytes, init: int = 0x66) -> int:
