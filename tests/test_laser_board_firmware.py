@@ -116,6 +116,12 @@ check("P200 sets laser to full", pwm.duty_cycle == 0xFFFF, str(pwm.duty_cycle))
 process_packet(packet(90, 1))
 check("R90 moves the servo", ns["servo_angle"] == 90.0, str(ns["servo_angle"]))
 
+print("\nreal commands are echoed so the host can confirm them")
+clear()
+process_packet(packet(150, 0)); process_packet(packet(45, 1))
+check("power and angle each reported as a MARK line",
+      [l.split()[:3] for l in marks()] == [["MARK","0","150"],["MARK","1","45"]], repr(marks()))
+
 print("\nset_power clamp (the pre-existing 16-bit overflow)")
 try:
     set_power(255); ok = pwm.duty_cycle == 0xFFFF
@@ -177,7 +183,7 @@ clear()
 
 print("\nsingle-bit frame repair")
 crc8_, crc16_ = ns["crc8_0x39"], ns["crc16_ccitt_0x1021"]
-process_frame, SYN = ns["process_frame"], ns["SYNDROME"]
+process_frame = ns["process_frame"]
 
 def build_frame(value, address):
     """A well-formed short frame carrying this command."""
@@ -189,11 +195,25 @@ def build_frame(value, address):
     buf[L - 2], buf[L - 1] = c & 0xFF, (c >> 8) & 0xFF
     return buf
 
-check("syndrome table has no collisions",
-      len(SYN) == ns["REPAIR_MAX_BITS"], f"{len(SYN)} of {ns['REPAIR_MAX_BITS']}")
-
 good = build_frame(230, 1)
 check("a clean frame validates", process_frame(bytearray(good)))
+
+print("\nas shipped, repair is off: a corrupted frame is never acted on")
+check("REPAIR_FRAMES is off", not ns["REPAIR_FRAMES"])
+clear()
+pwm_shipped = pwm.duty_cycle
+bad_mark = bytearray(good); bad_mark[7] ^= 0x04
+check("corrupted marker is dropped", not process_frame(bad_mark) and not marks(), repr(marks()))
+bad_pow = bytearray(build_frame(150, 0)); bad_pow[7] ^= 0x08
+check("corrupted power is dropped", not process_frame(bad_pow))
+check("and the light is untouched", pwm.duty_cycle == pwm_shipped, f"{pwm_shipped} -> {pwm.duty_cycle}")
+
+# The mechanism itself, should repair ever be switched back on.
+print("\nwith repair switched on")
+ns["REPAIR_FRAMES"] = True
+ns["SYNDROME"] = SYN = ns["build_syndrome_table"]()
+check("syndrome table has no collisions",
+      len(SYN) == ns["REPAIR_MAX_BITS"], f"{len(SYN)} of {ns['REPAIR_MAX_BITS']}")
 
 clear()
 corrupt = bytearray(good); corrupt[7] ^= 0x04          # one flipped bit in payload

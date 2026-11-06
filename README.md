@@ -332,13 +332,11 @@ MARK <address> <value> <board_uptime_ms> <seq>
 
 #### Making it reliable
 
-With no `M73` in the batch there is no second chance, so a marker must not be quietly lost. Three mechanisms cover that:
+Every batch carries both done markers: `M400`, then the serial marker `M620 R<code>`, then the MQTT marker `M73 P<n> R0`. The job completes on whichever arrives first. That is the serial one, milliseconds after the motion ends, unless the bus lost it; then the `M73` completes the job 1–2 s later, with nothing to decide or inject. Every batch takes its own `M73` percent from one counter cycling through 1–99, so no two in flight share one.
 
-- **The board queues markers rather than dropping them.** `report_marker()` appends to a backlog and `flush_markers()` drains whatever the port accepts, from the main loop and between frames of a burst. `write_timeout` is 0, so a partial write leaves the remainder at the head of the queue to be retried. The UART loop still never blocks — it reads at 1.2 Mbaud and the servo needs a pulse every 20 ms. The backlog is capped so a host that stopped reading cannot exhaust memory; hitting the cap counts as a drop, which is a bug worth seeing.
-- **Sequence numbers make loss visible.** `seq` is monotonic, so the host detects a gap on the next marker instead of inferring it later from a job that never finished. A sequence that goes backwards means the board restarted, which the port closing already reported, and is not counted as loss.
-- **The MQTT marker is injected lazily, only when needed.** On a port close, a sequence gap, or a job running past its estimate plus a 2 s grace, the host sends `M400` + `M73 P<n> R0` *then*. Because it queues behind everything already sent, it is gated just as exactly as one sent upfront, so injecting early or needlessly is harmless. One injected marker covers every job in flight. The stall timeout remains the last resort.
+The board also queues markers rather than dropping them, and numbers them (`seq`) so a loss shows up as a gap. Neither is needed for correctness any more, since the `M73` covers every batch, but the counters show how healthy the bus is.
 
-The practical failure this guards against is not bus loss — laser power rides on the same frames, so a lossy bus would already make the laser unsafe — but USB going away mid-job. The board resets every time its `code.py` is saved, which happens a lot while developing. Lazy fallback turns that from a stalled job with `head.uncertain` set into a couple of seconds of delay.
+G-code with laser or servo commands in it is split at each one and sent as a run of batches, each only once the one before it is done. A tool batch is `M400`, the command's `M620`, and its `M73`; the board's echo of the command is its serial marker. If the `M73` comes back without the echo, the command was lost on the bus and the batch is resent, up to 4 tries. See "Tool control G-code" in `laser board/README.md`.
 
 The board's once-a-second status line reports `marks=<sent>/<dropped>/<backlog>`, and `/api/status` carries `marker_link` with `marker_count`, `gap_count` and `lost_estimate`. Those are the numbers that substantiate a reliability claim; across a run they should all be zero but `sent`.
 
@@ -383,7 +381,7 @@ Note that sequence numbers only catch loss *between the board and the host*. A f
 That is a line-level problem, not a parsing one, and it turned out to be the pull-up. The RX node now has a small bias network, all switchable from software (`BIAS_MODE` in `code.py`):
 
 ```
-GPIO4 --2k7-- GPIO2 --510-- node (GPIO1, RX) --2k7-- GPIO3
+GPIO4 --2k7-- GPIO2 --510-- node (GPIO1, RX) --2k7-- GPIO3   (the GPIO3 resistor has since been removed)
 ```
 
 Sweeping all 27 combinations of GPIO2/3/4 high, low and floating showed frame corruption rising monotonically with pull-up stiffness:
@@ -398,7 +396,7 @@ Sweeping all 27 combinations of GPIO2/3/4 high, low and floating showed frame co
 | ~45k (the ESP32's internal pull-up) | nothing received |
 | none, or anything pulling GPIO2 low | garbage, or nothing |
 
-The printer's driver drives both levels itself, so the pull-up only needs to hold the line when nothing is driving it. A stiff one fights the driver on every low, which is exactly why every corrupted bit arrived `0 -> 1`. The 2.7k and 3.21k settings tied at zero over a four-round alternating run, so the default is `weak3k2`, chosen for margin: it sits further from the measured failure on the stiff side and nearer the middle of the working range.
+The printer's driver drives both levels itself, so the pull-up only needs to hold the line when nothing is driving it. A stiff one fights the driver on every low, which is exactly why every corrupted bit arrived `0 -> 1`. The 2.7k and 3.21k settings tied at zero over a four-round alternating run, so the default is `weak3k2`, chosen for margin: it sits further from the measured failure on the stiff side and nearer the middle of the working range. The 2.7k to GPIO3 was later removed, leaving `weak3k2` and `stiff` as the only modes.
 
 An earlier attempt to test a weaker pull-up used only the internal ~45k, which receives nothing, and wrongly concluded that 510 ohm was load-bearing. The working range is in between.
 

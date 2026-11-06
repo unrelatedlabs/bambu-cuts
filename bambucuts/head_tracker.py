@@ -86,7 +86,9 @@ def simulate(gcode_text: str, start: MotionState) -> Simulation:
     Handles G0/G1 (with modal F), G4 dwells, G90/G91, G92 and G28. Time is
     distance over feed with acceleration ignored, so short segments run a
     little slower on the real machine. E is treated as relative (M83), which
-    is how this rig is configured, and never contributes to travel time.
+    is how this rig is configured. A move with X/Y/Z takes its XYZ length
+    over feed; an E-only move (a prime or pullback) takes its E length over
+    feed, as the firmware runs it, and is not travel.
     """
     state = replace(start)
     seconds = 0.0
@@ -117,6 +119,7 @@ def simulate(gcode_text: str, start: MotionState) -> Simulation:
         elif cmd in ('G0', 'G1'):
             before = state.xyz()
             squared = 0.0
+            extruded = 0.0
             for letter, value in _words(upper)[1:]:
                 axis = letter.lower()
                 if letter == 'F':
@@ -125,6 +128,7 @@ def simulate(gcode_text: str, start: MotionState) -> Simulation:
                     continue
                 if axis == 'e':
                     state.e = state.e + value  # relative extrusion on this rig
+                    extruded += abs(value)
                     continue
                 if axis not in XYZ:
                     continue
@@ -136,6 +140,8 @@ def simulate(gcode_text: str, start: MotionState) -> Simulation:
                 duration = math.sqrt(squared) / (max(1.0, state.feed) / 60.0)
                 segments.append(Segment(seconds, seconds + duration, before, state.xyz()))
                 seconds += duration
+            elif extruded:
+                seconds += extruded / (max(1.0, state.feed) / 60.0)
 
     return Simulation(end=state, seconds=seconds, segments=segments)
 

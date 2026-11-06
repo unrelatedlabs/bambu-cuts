@@ -5,6 +5,9 @@ set -u
 cd "$(dirname "$0")/.."
 PY=${PY:-.venv/bin/python}
 [ -x "$PY" ] || PY=python3
+# Keep the tests' jobs and sends out of the real traffic log.
+export BAMBUCUTS_TRAFFIC_LOG=$(mktemp)
+trap 'rm -f "$BAMBUCUTS_TRAFFIC_LOG"' EXIT
 rc=0
 for t in tests/test_*.py; do
     printf '%-44s' "$t"

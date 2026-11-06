@@ -264,7 +264,10 @@ led.value = 1
 # The tap off the AMS-Lite pair is single-ended, so the pull-up on the RX
 # node decides how cleanly the printer's driver can pull it low.
 #
-#   GPIO4 --2k7-- GPIO2 --510-- node (GPIO1, RX) --2k7-- GPIO3
+#   GPIO4 --2k7-- GPIO2 --510-- node (GPIO1, RX)
+#
+# A second 2k7 from the node to GPIO3 was used for the sweep below and has
+# since been removed; GPIO3 is left alone.
 #
 # Swept on the A1 across all 27 combinations of GPIO2/3/4 high, low and
 # floating: errors rise monotonically with pull-up stiffness. The original
@@ -277,24 +280,19 @@ led.value = 1
 #
 #   mode        pull-up      measured frame corruption
 #   weak3k2     2k7+510      0 in 5938 frames   GPIO4 high through GPIO2's 510
-#   weak2k7     2k7          0 in 7900 frames   GPIO3 high, GPIO2/GPIO4 floating
-#   (1k47)      2k7 || 3k21  0.70%              GPIO3 and GPIO4 both high
 #   stiff       510          3-7%               the original wiring
-#   stiffest    429 || ...   10%                for comparison only
+#   (2k7)       2k7 to GPIO3 0 in 7900 frames   resistor since removed
+#   (1k47)      2k7 || 3k21  0.70%              resistor since removed
 #
-# The two weak settings tie on errors - a 4-round alternating run put both at
-# zero - so weak3k2 is chosen for margin: the measured failure side is stiff
-# (1k47 already errs) and the dead end is weak (the ~45k internal pull-up
-# receives nothing), and 3k21 sits further from the failure and nearer the
-# middle of that range.
+# 2k7 and 3k21 tied on errors, and 3k21 sits further from the stiff side
+# where the failures are, while the ~45k internal pull-up alone receives
+# nothing.
 BIAS_MODE = "weak3k2"
 
 _BIAS = {
-    #            GPIO2   GPIO3   GPIO4      (1 drive high, 0 drive low, None hi-Z)
-    "weak2k7":  (None,   1,      None),
-    "weak3k2":  (None,   None,   1),
-    "stiff":    (1,      None,   None),
-    "stiffest": (1,      1,      1),
+    #            GPIO2   GPIO4      (1 drive high, 0 drive low, None hi-Z)
+    "weak3k2":  (None,   1),
+    "stiff":    (1,      None),
 }
 
 
@@ -311,8 +309,7 @@ def _set_bias_pin(pin, level):
 
 _levels = _BIAS.get(BIAS_MODE, _BIAS["stiff"])
 pullup = _set_bias_pin(microcontroller.pin.GPIO2, _levels[0])
-pulldown = _set_bias_pin(microcontroller.pin.GPIO3, _levels[1])
-pullup_weak = _set_bias_pin(microcontroller.pin.GPIO4, _levels[2])
+pullup_weak = _set_bias_pin(microcontroller.pin.GPIO4, _levels[1])
 
 
 # ===== CRC Helpers (no xor, no reverse) =====
@@ -349,22 +346,27 @@ def crc16_ccitt_0x1021(data: bytes, init: int = 0x913D) -> int:
 #
 # Each entry is the previous one advanced a single CRC step, because shifting
 # the error pattern one bit multiplies it by x modulo the polynomial.
-REPAIR_FRAMES = True
+#
+# Off. A frame that only passes after a "repair" is never acted on: with the
+# printer idle the board repaired several corrupted background frames a
+# minute into power commands that were never sent, one of them switching the
+# UV light on. A corrupted frame is dropped instead; a lost done-marker is
+# covered by the host's MQTT fallback. The code stays for diagnostics.
+REPAIR_FRAMES = False
 REPAIR_MAX_BITS = 8 * 40
 
-# Whether a repaired frame may carry a power command as well as a marker.
+# Whether a repaired frame may carry a power or servo command as well as a
+# marker. It may not.
 #
-# Searching 240 candidates until one passes a 16-bit CRC accepts a wrong
-# value roughly 0.4% of the time, so this is a trade rather than free. For
-# the UV curing light this board drives, the alternative is worse: a dropped
-# command leaves the light at its PREVIOUS setting, so a lost "off" overcures
-# the part. Right 99.6% of the time beats right never.
+# Searching the syndrome table until a candidate passes the CRC16 accepts a
+# wrong frame some of the time, and on the bus that is far from rare: with
+# the printer idle - sending no commands at all - the board "repaired" about
+# five corrupted background frames a minute into power commands, one of
+# them turning the UV light on at v=4. A dropped command is the lesser harm.
 #
-# Set this False if a cutting laser is ever fitted in place of the UV light.
-# Then a wrong power is a safety problem rather than a quality one, and
-# markers alone stay repairable - a spurious one at worst completes a job
-# early, and the host's timestamp guard rejects a stale one.
-REPAIR_POWER_COMMANDS = True
+# Markers stay repairable: a spurious one has to hit the exact code the host
+# is waiting for, and at worst completes a job early.
+REPAIR_POWER_COMMANDS = False
 
 repairs_ok = 0
 repairs_rejected = 0
@@ -527,6 +529,9 @@ def process_packet(payload):
             last_power_countdown = 60
         elif address == 1:
             set_servo(value)
+        # Real commands are reported like markers too: the host sends each
+        # one in a batch of its own and resends it if this never arrives.
+        report_marker(address, value)
 
     except Exception as e:
         print(e)
@@ -628,7 +633,7 @@ def process_frame(buf: bytearray) -> bool:
 # ===== Main loop: read ONE BYTE at a time =====
 reset()
 
-print("Hello")
+print(f"Hello bias={BIAS_MODE}")
 ticks = 0
 def tick():
     global ticks
@@ -654,7 +659,8 @@ while True:
              f"marks={markers_sent}/{markers_dropped}/{len(out_backlog)} "
              f"fixed={repairs_ok}/{repairs_rejected} "
              f"orphan={orphan_bytes}/{orphan_runs} "
-             f"host={'up' if marker_port.connected else 'down'}\n")
+             f"host={'up' if marker_port.connected else 'down'} "
+             f"bias={BIAS_MODE}\n")
         while bad_frames:
             why, raw = bad_frames.pop(0)
             emit("BADFRAME %s %s\n" % (why, raw.hex()))

@@ -24,6 +24,7 @@ import base64
 import math
 import statistics
 import itertools
+import collections
 import uuid
 from io import BytesIO
 
@@ -46,6 +47,60 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = 'a1plotter-secret-key'
 CORS(app)  # Enable CORS for all routes
 socketio = SocketIO(app, cors_allowed_origins="*")
+
+# ---------------------------------------------------------------------------
+# Traffic log: every API call, every publish to the printer, every marker
+# from the board and every job state change, one JSON line each, so gaps
+# between batches can be measured after the fact. `t` is wall time.
+# Status polls are logged too but without bodies, since there are many.
+TRAFFIC_QUIET_PATHS = ('/api/status', '/api/mqtt-pushall')
+traffic_lock = threading.Lock()
+
+
+def traffic_log_path():
+    if os.environ.get('BAMBUCUTS_TRAFFIC_LOG'):
+        return Path(os.environ['BAMBUCUTS_TRAFFIC_LOG'])
+    profile = config.get_profile()
+    return config.CONFIG_DIR / f".bambucuts{'.' + profile if profile else ''}.traffic.log"
+
+
+def traffic(kind, **fields):
+    entry = {'t': round(time.time(), 4), 'kind': kind, **fields}
+    try:
+        line = json.dumps(entry, default=str)
+        with traffic_lock, open(traffic_log_path(), 'a') as f:
+            f.write(line + '\n')
+    except Exception as e:
+        print(f"Cannot write traffic log: {e}")
+
+
+@app.before_request
+def _traffic_request():
+    request.environ['bambucuts.t0'] = time.time()
+    if request.path.startswith('/static') or request.path in TRAFFIC_QUIET_PATHS:
+        return
+    body = request.get_json(silent=True) if request.method == 'POST' else None
+    traffic('api_request', method=request.method, path=request.path,
+            query=request.query_string.decode() or None, body=body)
+
+
+@app.after_request
+def _traffic_response(response):
+    if request.path.startswith('/static'):
+        return response
+    t0 = request.environ.get('bambucuts.t0') or time.time()
+    fields = {'method': request.method, 'path': request.path, 'status': response.status_code,
+              'seconds': round(time.time() - t0, 4)}
+    if request.path not in TRAFFIC_QUIET_PATHS and response.is_json:
+        data = response.get_json(silent=True)
+        if isinstance(data, dict):
+            job = data.get('direct_job') or {}
+            fields.update({k: data.get(k) for k in ('success', 'job_id', 'error', 'waited_seconds', 'completed')
+                           if data.get(k) is not None})
+            if job:
+                fields['job_status'] = job.get('status')
+    traffic('api_response', **fields)
+    return response
 
 # Global state
 state = {
@@ -86,9 +141,13 @@ MQTT_STALE_SECONDS = 30.0
 MQTT_RECONNECT_DELAY = 5.0
 
 # A direct job is considered stalled once it has waited longer than its
-# estimated run time (from feed rates) times this factor, but never less than
-# the floor, so tiny jobs get time for the MQTT checkpoint to arrive.
-DIRECT_JOB_TIMEOUT_FACTOR = 1.5
+# estimated run time (from feed rates) times this factor plus the pad. The
+# estimate ignores acceleration, and slow dispensing batches really take
+# about 1.5x it, so the factor leaves room above that. A caller can pass
+# its own timeout_seconds instead. The pad also gives tiny jobs time for
+# the MQTT checkpoint to arrive.
+DIRECT_JOB_TIMEOUT_FACTOR = 2.0
+DIRECT_JOB_TIMEOUT_PAD_SECONDS = 30.0
 DIRECT_JOB_MIN_TIMEOUT_SECONDS = 30.0
 
 # While a direct job is active, ask the printer for a full status report this
@@ -123,17 +182,23 @@ def _handle_marker(address, value, at):
 
     Kept to one call on purpose: this runs on the reader thread, which must
     get back to the port promptly, and work here delays the next marker.
+    Values below the marker range are real laser and servo commands, which
+    the board echoes so a tool batch can be confirmed.
     """
-    update_direct_job_from_marker(value, at, address=address)
+    traffic('board_marker', address=address, value=value, at=at)
+    note_board_mark(address, value, at)
+    if value >= SIDE_MARKER_MIN:
+        update_direct_job_from_marker(value, at, address=address)
 
 
 def _handle_marker_lost(reason):
-    """The side channel cannot be trusted right now: cover in-flight jobs.
+    """The port closed or a sequence gap showed a marker was lost.
 
-    Called from the reader thread when the port closes or a sequence gap
-    shows a marker was lost.
+    Nothing to do: every batch also carries its MQTT marker, which completes
+    it when the serial one does not arrive.
     """
-    inject_mqtt_fallback(reason)
+    traffic('marker_lost', reason=reason)
+    print(f"Laser board markers: {reason}; batches in flight complete on their MQTT marker")
 
 
 def start_marker_link():
@@ -261,13 +326,13 @@ def _merge_mqtt_print_status(print_status):
 
     if changes:
         summary = ', '.join(f"{key}: {old} -> {new}" for key, (old, new) in changes.items())
+        traffic('mqtt_change', summary=summary)
         print(f"Printer progress changed: {summary}")
 
     # Resolve the active direct job here, not only when a client polls
     # /api/status, so completion is recorded even with no browser open.
     _, mqtt_progress = current_mqtt_progress()
     update_direct_job_from_mqtt(mqtt_progress)
-    check_side_channel_watchdog()
 
 
 # Keep this many reports per job for the benchmark / job endpoints.
@@ -648,13 +713,10 @@ def set_positioning_mode(absolute: bool) -> bool:
     if not state['printer_connected'] or not printer:
         return False
 
-    try:
-        printer.gcode(gcode)
-        print(f"Set printer to {'absolute' if absolute else 'relative'} mode ({gcode})")
-        return True
-    except Exception as e:
-        print(f"Failed to set {'absolute' if absolute else 'relative'} mode: {e}")
-        return False
+    # Through the send queue like everything else, so it lands in order
+    # behind anything still waiting to go out.
+    ran, success = send_queue.submit(lambda: send_gcode_to_printer(gcode))
+    return success if ran else True
 
 
 def set_relative_mode() -> bool:
@@ -667,6 +729,28 @@ def set_absolute_mode() -> bool:
     return set_positioning_mode(True)
 
 
+# The printer stalls on a gcode_line message bigger than about 1 KB: it reads
+# the first part and leaves the rest until the next packet arrives on that
+# connection, which can take a minute. Measured with dwell-only payloads:
+# up to 980 bytes of JSON always ran at once, 1000 bytes and up waited 8-58 s,
+# and a second publish 0.2 s behind a 1100-byte one got it acknowledged
+# 0.23 s after sending. So after any message near that size a pushall goes
+# out on the same connection; it touches nothing in the G-code queue.
+NUDGE_PAYLOAD_BYTES = 900
+
+
+def _nudge_if_large(param: str):
+    """Follow a large gcode_line message with a pushall so the printer reads it now."""
+    size = len(json.dumps({"print": {"sequence_id": "0", "command": "gcode_line", "param": param}}))
+    if size < NUDGE_PAYLOAD_BYTES:
+        return
+    try:
+        printer.mqtt_client.pushall()
+        traffic('printer_nudge', payload_bytes=size)
+    except Exception as e:
+        print(f"Could not follow a {size}-byte G-code message with a pushall: {e}")
+
+
 def send_gcode_to_printer(gcode: str) -> bool:
     """Send G-code command to the printer."""
     if not state['printer_connected'] or not printer:
@@ -676,29 +760,112 @@ def send_gcode_to_printer(gcode: str) -> bool:
     try:
         # gcode_check=False: the library's validator rejects bare axis flags
         # (e.g. "G28 X"), so skip it and let the printer do the validating.
+        t0 = time.time()
         printer.gcode(gcode, gcode_check=False)
+        _nudge_if_large(gcode)
+        traffic('printer_send', lines=gcode.split('\n'), publish_seconds=round(time.time() - t0, 4))
         print(f"G-code sent to printer: {gcode}")
         return True
     except Exception as e:
+        traffic('printer_send_failed', lines=gcode.split('\n'), error=str(e))
         print(f"Failed to send G-code to printer: {e}")
         state['connection_error'] = str(e)
         return False
+
+
+class SendQueue:
+    """Everything sent to the printer goes out in the order it was submitted.
+
+    A job with tool commands sends in pieces, holding at each one until the
+    laser board confirms it, which can take as long as the job's motion. A
+    jog or another job submitted meanwhile must not slip into one of those
+    gaps, so it waits here instead, and the caller is not kept waiting.
+
+    When nothing is ahead, a submission runs on the caller's thread and its
+    result comes straight back, exactly as a direct send would. Otherwise it
+    is queued for the worker thread, and submit() returns at once.
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._pending = collections.deque()
+        self._busy = False
+        self._worker = None
+
+    def submit(self, fn, inline=True):
+        """Run or queue fn. Returns (ran, result); result is None when queued."""
+        with self._cond:
+            if inline and not self._busy and not self._pending:
+                self._busy = True
+            else:
+                self._pending.append(fn)
+                if len(self._pending) > 1 or self._busy:
+                    print(f"Send queued behind {len(self._pending) - 1 + self._busy} earlier send(s)")
+                if self._worker is None:
+                    self._worker = threading.Thread(target=self._run, daemon=True, name='printer-send')
+                    self._worker.start()
+                return False, None
+        try:
+            return True, fn()
+        finally:
+            with self._cond:
+                self._busy = False
+                self._cond.notify_all()
+
+    def _run(self):
+        while True:
+            with self._cond:
+                while self._busy:
+                    self._cond.wait()
+                if not self._pending:
+                    self._worker = None
+                    return
+                fn = self._pending.popleft()
+                self._busy = True
+            try:
+                fn()
+            except Exception as e:
+                print(f"Queued send failed: {e}")
+            finally:
+                with self._cond:
+                    self._busy = False
+                    self._cond.notify_all()
+
+    def clear(self):
+        """Drop everything not yet started. Returns how many were dropped."""
+        with self._cond:
+            dropped = len(self._pending)
+            self._pending.clear()
+            return dropped
+
+    def depth(self):
+        with self._cond:
+            return len(self._pending) + self._busy
+
+
+send_queue = SendQueue()
 
 
 def send_tracked(gcode: str) -> bool:
     """Record G-code in the head tracker, then send it if the printer is connected.
 
     Used by the jog, homing, zeroing and manual-command paths. Direct jobs
-    are tracked as a unit by queue_direct_gcode instead.
+    are tracked as a unit by queue_direct_gcode instead. Goes through the
+    send queue; True when queued behind earlier sends.
     """
     head.apply(gcode)
     if not state['printer_connected']:
         return True
-    return send_gcode_to_printer(gcode)
+    ran, success = send_queue.submit(lambda: send_gcode_to_printer(gcode))
+    return success if ran else True
 
 
 def send_gcode_lines_to_printer(lines: list) -> bool:
-    """Send several G-code lines to the printer in a single MQTT gcode_line command."""
+    """Send several G-code lines to the printer in a single MQTT gcode_line command.
+
+    Batch size is the caller's choice; see NUDGE_PAYLOAD_BYTES for what
+    keeps a big one from stalling.
+    """
     if not state['printer_connected'] or not printer:
         print(f"Cannot send G-code - printer not connected: {len(lines)} lines")
         return False
@@ -709,10 +876,14 @@ def send_gcode_lines_to_printer(lines: list) -> bool:
     try:
         # The library joins the list with newlines into one gcode_line payload.
         # gcode_check=False for the same reason as the single-line send.
+        t0 = time.time()
         printer.gcode(list(lines), gcode_check=False)
+        _nudge_if_large('\n'.join(lines))
+        traffic('printer_send', lines=list(lines), publish_seconds=round(time.time() - t0, 4))
         print(f"G-code batch sent to printer: {len(lines)} lines")
         return True
     except Exception as e:
+        traffic('printer_send_failed', lines=list(lines), error=str(e))
         print(f"Failed to send G-code batch to printer: {e}")
         state['connection_error'] = str(e)
         return False
@@ -833,7 +1004,8 @@ def estimate_gcode_seconds(gcode_text: str, start: MotionState = None) -> float:
 
 def direct_job_timeout_seconds(estimated_seconds: float) -> float:
     """Stall timeout for a direct job: padded estimate, never below the floor."""
-    return max(DIRECT_JOB_MIN_TIMEOUT_SECONDS, estimated_seconds * DIRECT_JOB_TIMEOUT_FACTOR)
+    return max(DIRECT_JOB_MIN_TIMEOUT_SECONDS,
+               estimated_seconds * DIRECT_JOB_TIMEOUT_FACTOR + DIRECT_JOB_TIMEOUT_PAD_SECONDS)
 
 
 # Every tracked batch ends in a done marker, and a job completes when one
@@ -850,10 +1022,9 @@ def direct_job_timeout_seconds(estimated_seconds: float) -> float:
 # the 0-200 the board reads as a real servo angle, so the board can tell
 # them apart and leave its outputs alone.
 #
-# When the board is connected the batch carries ONLY the side-channel
-# marker: no M73 goes out, so the printer's own progress display is left
-# alone and nothing waits on its slow status snapshot. The MQTT marker is
-# instead injected later, and only if needed - see inject_mqtt_fallback().
+# Every batch carries both: the side-channel marker (when the board is
+# connected) and then the M73. The job completes on whichever arrives
+# first, which is the side-channel one unless the bus lost it.
 #
 # The M400 before the markers (when used) drains queued motion first.
 MARKER_FIELD = 'mc_percent'
@@ -870,15 +1041,9 @@ SIDE_MARKER_MAX = 251
 #
 # Splitting a block across separate publishes does produce an occasional
 # second frame, but costs ~100ms per publish and measured worse overall.
-# Loss is handled by the MQTT fallback instead; see inject_mqtt_fallback().
+# Loss is covered by the M73 every batch also carries.
 SIDE_MARKER_REPEATS = 1
 
-# How long past a job's estimated run time to wait for its side-channel
-# marker before injecting the MQTT fallback. Injecting early is harmless:
-# the fallback is gated by its own M400, so it cannot report completion
-# before the motion is actually done, and the estimate ignores acceleration
-# and so runs short rather than long.
-SIDE_CHANNEL_GRACE_SECONDS = 2.0
 _side_marker_counter = itertools.count()
 
 
@@ -906,28 +1071,29 @@ def side_channel_ready() -> bool:
     return bool(marker_link is not None and marker_link.status().get('connected'))
 
 
-def next_marker_percent() -> int:
-    """Pick the M73 percent for a new job so its report is unambiguous.
+_marker_percent_lock = threading.Lock()
+_last_marker_percent = None
 
-    Chains after the newest in-flight job that has an MQTT marker, so
-    markers of queued batches arrive in order; otherwise steps past what
-    the printer currently reports. Side-channel jobs carry no MQTT marker
-    until one is injected, so they are skipped rather than chained from.
+
+def next_marker_percent() -> int:
+    """Next M73 percent, from one counter cycling through 1-99.
+
+    Every batch and sub-batch takes the next value, so no two markers in
+    flight share one and none repeats what the printer last reported.
+    The first value steps past the printer's current report.
     """
-    with direct_job_lock:
-        pending = [j.get('marker_value') for j in _active_direct_jobs()]
-    newest = next((v for v in reversed(pending) if v is not None), None)
-    if newest is not None:
-        try:
-            return (int(newest) + 1) % 100
-        except (TypeError, ValueError):
-            pass
-    with mqtt_status_lock:
-        current = (state['mqtt_status'].get('print') or {}).get(MARKER_FIELD)
-    try:
-        return (int(current) + 1) % 100
-    except (TypeError, ValueError):
-        return 1
+    global _last_marker_percent
+    with _marker_percent_lock:
+        last = _last_marker_percent
+        if last is None:
+            with mqtt_status_lock:
+                current = (state['mqtt_status'].get('print') or {}).get(MARKER_FIELD)
+            try:
+                last = int(current)
+            except (TypeError, ValueError):
+                last = 0
+        _last_marker_percent = last % 99 + 1
+        return _last_marker_percent
 
 
 def add_completion_marker(gcode_text: str, wait_for_motion: bool = True):
@@ -938,10 +1104,9 @@ def add_completion_marker(gcode_text: str, wait_for_motion: bool = True):
     the parser reaches them, a few moves ahead of the pen, which keeps
     motion continuous when another batch is queued behind.
 
-    With the laser board connected the batch carries only the side-channel
-    marker; the MQTT M73 is not sent at all, and is injected later only if
-    the side channel fails (inject_mqtt_fallback). With no board it carries
-    the M73 exactly as it always did.
+    Both markers go on every batch: the serial one (M620 R<code>, when the
+    laser board is connected) and the MQTT one (M73). The job completes on
+    whichever arrives first.
     """
     total_commands = sum(1 for _ in extract_executable_gcode(gcode_text))
     if total_commands == 0:
@@ -960,10 +1125,8 @@ def add_completion_marker(gcode_text: str, wait_for_motion: bool = True):
 
     side_codes = next_side_marker_block() if side_channel_ready() else []
     side_lines = [f"M620 R{c} M621 R{c}" for c in side_codes]
-    # The MQTT percent is allocated at injection time instead, so it reflects
-    # what the printer reports then rather than when the batch was built.
-    percent = None if side_lines else next_marker_percent()
-    marker_line = f"M73 P{percent} R0" if percent is not None else None
+    percent = next_marker_percent()
+    marker_line = f"M73 P{percent} R0"
 
     estimated_seconds = estimate_gcode_seconds(gcode_text)
     marker_lines = [f"; bambucuts done marker: {total_commands} command(s)"]
@@ -979,7 +1142,7 @@ def add_completion_marker(gcode_text: str, wait_for_motion: bool = True):
         'command_count': total_commands,
         'marker_line': marker_line,
         'marker_field': MARKER_FIELD,
-        'marker_value': str(percent) if percent is not None else None,
+        'marker_value': str(percent),
         'side_marker_values': [str(c) for c in side_codes] or None,
         'side_marker_line': side_lines[0] if side_lines else None,
         # The executable marker lines, so the send path can tell them from
@@ -1001,6 +1164,9 @@ def _active_direct_jobs():
 
 def _finish_direct_job(job, status, message, completed_at=None):
     """Move a job out of the active list. Caller holds direct_job_lock."""
+    traffic('job_finished', job_id=job['id'], status=status, message=message,
+            source=job.get('detect_source'), detect_seconds=job.get('detect_seconds'),
+            estimated_seconds=job.get('estimated_seconds'))
     job['active'] = False
     job['status'] = status
     job['completed_at'] = completed_at or time.time()
@@ -1038,9 +1204,6 @@ def begin_direct_job(progress_info):
         'marker_value': progress_info.get('marker_value'),
         'side_marker_values': progress_info.get('side_marker_values'),
         'side_marker_line': progress_info.get('side_marker_line'),
-        # True once an MQTT marker exists for this job, either sent with the
-        # batch or injected later. Stops a second injection.
-        'fallback_sent': progress_info.get('marker_value') is not None,
         'wait_for_motion': progress_info.get('wait_for_motion', True),
         'estimated_seconds': progress_info.get('estimated_seconds', 0.0),
         'timeout_seconds': progress_info.get('timeout_seconds', DIRECT_JOB_MIN_TIMEOUT_SECONDS),
@@ -1056,6 +1219,9 @@ def begin_direct_job(progress_info):
     else:
         how = (f"marker '{job['marker_line']}' expecting "
                f"{job['marker_field']}={job['marker_value']}")
+    traffic('job_started', job_id=job['id'], command_count=job['command_count'],
+            side_markers=job['side_marker_values'], estimated_seconds=job['estimated_seconds'],
+            timeout_seconds=job['timeout_seconds'])
     print(f"Direct job {job['id']} started: {job['command_count']} command(s), {how}, "
           f"estimated {job['estimated_seconds']}s, timeout {job['timeout_seconds']}s")
 
@@ -1103,6 +1269,8 @@ def mark_direct_job_queued(job_id, queued_count, errors):
         job['deadline'] = base + (job.get('timeout_seconds') or DIRECT_JOB_MIN_TIMEOUT_SECONDS)
         job['status'] = 'waiting'
         job['message'] = 'Queued; waiting for the printer to reach the done marker'
+        traffic('job_queued', job_id=job_id, queued_count=queued_count,
+                estimated_seconds=job.get('estimated_seconds'), timeout_seconds=job.get('timeout_seconds'))
         _store_direct_job(job)
         return dict(job)
 
@@ -1160,10 +1328,8 @@ def _find_marker_job(active, value, at, field):
     through a small range and nothing else separates a stale marker still
     on the wire from the one this job is waiting for.
 
-    The newest match, not the first: one injected fallback marker covers
-    every job in flight, so they share a value, and the caller completes
-    everything up to the index returned. Values are unique per job
-    otherwise, where newest and first are the same thing.
+    Values are unique per job, so newest and first are the same thing; the
+    caller completes everything up to the index returned.
     """
     return next((i for i in range(len(active) - 1, -1, -1)
                  if _job_expects(active[i], field, value)
@@ -1252,95 +1418,12 @@ def update_direct_job_from_marker(value, at, address=None):
 
         matched = _find_marker_job(active, value, at, 'side_marker_values')
         if matched is None:
-            # Worth a line rather than silence. The likeliest cause is the
-            # printer encoding `M620 R<n>` as something other than the n we
-            # wrote, which shows up here as a marker whose value no job
-            # expects. The job still completes on its MQTT marker, so the
-            # symptom is lost speed, not a stuck job.
-            expected = [j.get('side_marker_values') for j in active]
-            print(f"Marker {value} (address {address}) matches no in-flight job, "
-                  f"which expect {expected}; falling back to the MQTT marker")
+            # A sub-batch marker (see run_tool_batches), or a stale one.
             return dict(state.get('direct_job') or {})
 
         _complete_matched_jobs(active, matched, at, 'side-channel',
                                f"laser board marker {value}")
         return dict(state.get('direct_job') or {})
-
-
-def _jobs_awaiting_fallback(now=None):
-    """In-flight side-channel jobs with no MQTT marker to fall back on.
-
-    Caller must NOT hold direct_job_lock. Returns them oldest first; an
-    empty list means every in-flight job is already covered.
-    """
-    now = now or time.time()
-    with direct_job_lock:
-        return [dict(j) for j in _active_direct_jobs()
-                if j.get('side_marker_values') and not j.get('fallback_sent')
-                and j.get('queued_at')]
-
-
-def inject_mqtt_fallback(reason):
-    """Send an MQTT done marker for in-flight jobs the side channel may have lost.
-
-    One marker covers every job in flight. It queues behind everything
-    already sent, so by the time it executes all of those jobs have run,
-    and _complete_matched_jobs resolves them together. Its own M400 is what
-    keeps it exact, so injecting this early or needlessly is harmless.
-
-    This is the whole reason no M73 goes out with the batch: the MQTT path
-    costs nothing until the side channel actually lets us down.
-    """
-    pending = _jobs_awaiting_fallback()
-    if not pending:
-        return None
-    if not state['printer_connected']:
-        print(f"Cannot inject MQTT fallback ({reason}): printer not connected")
-        return None
-
-    percent = next_marker_percent()
-    lines = ["M400", f"M73 P{percent} R0"]
-
-    # Claim the jobs before sending, so a second trigger cannot double-inject.
-    with direct_job_lock:
-        claimed = []
-        for job in _active_direct_jobs():
-            if job.get('side_marker_values') and not job.get('fallback_sent'):
-                job['fallback_sent'] = True
-                job['marker_value'] = str(percent)
-                job['marker_line'] = lines[1]
-                job['fallback_reason'] = reason
-                _store_direct_job(job)
-                claimed.append(job['id'])
-    if not claimed:
-        return None
-
-    print(f"Injecting MQTT fallback marker {MARKER_FIELD}={percent} for "
-          f"{len(claimed)} job(s): {reason}")
-    if not send_gcode_lines_to_printer(lines):
-        # Leave fallback_sent set: retrying would only queue another marker
-        # behind the first. The stall timeout remains the backstop.
-        print("Failed to send the MQTT fallback marker; job(s) rely on the stall timeout")
-    for line in lines:
-        add_to_history(line)
-    return percent
-
-
-def check_side_channel_watchdog():
-    """Inject the MQTT fallback for any job whose marker is overdue.
-
-    The side channel reports within a few hundred milliseconds of the motion
-    ending, so a job past its estimate plus the grace period has very likely
-    lost its marker - or the board went away without the port noticing.
-    Called wherever job state is already being refreshed.
-    """
-    now = time.time()
-    overdue = [j for j in _jobs_awaiting_fallback(now)
-               if now - j['queued_at'] > (j.get('estimated_seconds') or 0.0)
-               + SIDE_CHANNEL_GRACE_SECONDS]
-    if overdue:
-        waited = now - min(j['queued_at'] for j in overdue)
-        inject_mqtt_fallback(f'no side-channel marker after {waited:.1f}s')
 
 
 def current_mqtt_progress():
@@ -1462,6 +1545,7 @@ def get_status():
         'mqtt_progress': mqtt_progress,
         'mqtt_status': mqtt_status,
         'marker_link': marker_link_status(),
+        'tool_commands': tool_command_status(),
         'direct_job': direct_job,
         'camera_streaming': state['camera_streaming'],
         'camera_alive': camera_alive
@@ -1743,7 +1827,10 @@ def estop():
     print(f"E-stop: sent MQTT '{command}' -> {success}")
 
     aborted = []
+    dropped = 0
     if command != 'resume':
+        # Sends still waiting their turn are dropped with the jobs.
+        dropped = send_queue.clear()
         with direct_job_lock:
             for job in list(_active_direct_jobs()):
                 _finish_direct_job(job, 'aborted', f"Aborted by e-stop ({command})")
@@ -1755,6 +1842,7 @@ def estop():
         'command': command,
         'sent_at': sent_at,
         'aborted_jobs': aborted,
+        'dropped_sends': dropped,
     })
 
 
@@ -1804,7 +1892,15 @@ def execute_gcode():
         return jsonify({'success': False, 'error': 'Empty G-code'}), 400
 
     # Same M3/M5/M280 translation as the direct-send path.
-    gcode, _ = translate_tool_gcode(gcode)
+    translated, counts = translate_tool_gcode(gcode)
+    if (state['printer_connected'] and side_channel_ready()
+            and any(s['kind'] == 'tool' for s in split_tool_batches(translated))):
+        # Tool commands get the confirmed, resent-if-lost path.
+        result = queue_direct_gcode(gcode, single_call=True)
+        return jsonify({'success': result['success'], 'position': head.position,
+                        'gcode': translated, 'job_id': result.get('job_id'),
+                        'errors': result.get('errors')})
+    gcode = translated
     add_to_history(gcode)
     success = send_tracked(gcode)
 
@@ -1970,49 +2066,254 @@ def format_gcode():
     })
 
 
-def queue_direct_gcode(gcode_text: str, single_call: bool = False, progress_markers: bool = True,
-                       wait_for_motion: bool = True):
-    """Queue G-code on the printer as a tracked direct job.
+# ---------------------------------------------------------------------------
+# Sub-batches: G-code with laser or servo commands in it.
+#
+# The AMS-Lite tap corrupts the odd frame, and a corrupted laser or servo
+# command is simply lost. So when the laser board is connected, G-code with
+# tool commands in it is split at each one and sent as a run of batches, one
+# after another, each sent only once the one before it is done:
+#
+#   motion batch:  <lines>, M400, M620 R<code> (serial marker), M73 P<n> R0
+#   tool batch:    M400, M620 P/R<value>, M73 P<n> R0
+#
+# A batch is done when either of its markers comes back: the serial one off
+# the laser board within milliseconds of the motion ending, or the M73 over
+# MQTT one to two seconds later should the serial one be lost.
+#
+# A tool batch needs no serial marker of its own: the board echoes every
+# command it decodes, so the command itself is its serial marker. (A
+# separate one would not even work for the servo: the printer sends one bus
+# frame per channel per publish, carrying only the last value, so a marker
+# on R would swallow the servo move.) If the M73 comes back and the echo
+# never does, the printer ran the command but the board did not get it, so
+# the batch is sent again. Commands are absolute (a power, an angle), so a
+# repeat is harmless.
+#
+# Every tool confirmation, miss and failure is logged to the server output
+# and appended as JSON lines to tool_log_path().
+TOOL_LINE = re.compile(r'^M620\s+([PR])(\d+)\b', re.I)
+TOOL_ADDRESS = {'P': 0, 'R': 1}
+TOOL_MAX_ATTEMPTS = 4
+BOARD_MARK_KEEP = 128
+TOOL_LOG_KEEP = 200
 
-    Returns the same dict the send-all endpoint reports. When progress
-    markers are on and the printer is connected, the returned 'direct_job'
-    can be followed to completion with wait_for_direct_job(). The head
-    tracker simulates the batch from wherever the queued G-code leaves the
-    head, and commits it when the done marker arrives.
+board_mark_cond = threading.Condition()
+board_marks = []        # (address, value, at) as read off the board, newest last
+tool_log = []           # recent tool events, newest last
+tool_stats = {'confirmed': 0, 'missed': 0, 'resent_ok': 0, 'failed': 0}
+
+
+def tool_log_path():
+    profile = config.get_profile()
+    return config.CONFIG_DIR / f".bambucuts{'.' + profile if profile else ''}.tool-commands.log"
+
+
+def note_board_mark(address, value, at):
+    """Anything the board reported: a done marker or a command echo. Reader thread."""
+    with board_mark_cond:
+        board_marks.append((address, value, at))
+        del board_marks[:-BOARD_MARK_KEEP]
+        board_mark_cond.notify_all()
+
+
+def _find_board_mark(address, value, since):
+    """Arrival time of a matching report at or after `since`. Caller holds board_mark_cond.
+
+    address None matches either channel, as done markers are matched on
+    their value alone.
     """
-    progress_info = {
-        'enabled': False,
-        'command_count': sum(1 for _ in extract_executable_gcode(gcode_text)),
-        'marker_value': None,
-        'estimated_seconds': round(estimate_gcode_seconds(gcode_text), 1),
-        'timeout_seconds': 0.0,
-    }
-    # Tool commands become laser board commands before anything else looks
-    # at the G-code, so history, the head tracker and the done markers all
-    # see what is actually sent.
-    gcode_text, tool_counts = translate_tool_gcode(gcode_text)
-    if tool_counts['laser'] or tool_counts['servo']:
-        print(f"Translated {tool_counts['laser']} laser and {tool_counts['servo']} "
-              f"servo command(s) into laser board commands")
+    return next((at for a, v, at in reversed(board_marks)
+                 if v == value and (address is None or a == address) and at >= since), None)
 
-    gcode_to_send = gcode_text
-    if progress_markers:
-        gcode_to_send, progress_info = add_completion_marker(gcode_text, wait_for_motion=wait_for_motion)
 
-    sent_count = 0
-    queued_count = 0
+def _log_tool_event(event, segment, **fields):
+    entry = {'at': time.time(), 'event': event, 'command': segment['command'],
+             'address': segment['address'], 'value': segment['value'], **fields}
+    detail = ' '.join(f"{k}={v}" for k, v in fields.items() if v is not None)
+    traffic('tool_' + event, command=segment['command'], **fields)
+    print(f"Tool command {event}: {segment['command']} {detail}".rstrip())
+    with board_mark_cond:
+        tool_log.append(entry)
+        del tool_log[:-TOOL_LOG_KEEP]
+        if event in tool_stats:
+            tool_stats[event] += 1
+    try:
+        with open(tool_log_path(), 'a') as f:
+            f.write(json.dumps(entry) + '\n')
+    except OSError as e:
+        print(f"Cannot write tool log: {e}")
+
+
+def tool_command_status():
+    with board_mark_cond:
+        return {'stats': dict(tool_stats), 'recent': tool_log[-10:], 'log_path': str(tool_log_path())}
+
+
+def split_tool_batches(gcode_text: str):
+    """Split translated G-code into motion segments and single tool commands.
+
+    Returns [{'kind': 'gcode', 'lines': [...]}, {'kind': 'tool', 'lines':
+    ['M400', <M620 line>], 'address', 'value', 'command'}, ...], executable
+    lines only. Any M620 P/R below the marker range counts as a tool command,
+    hand-written ones included. An M400 right before one is folded into it.
+    """
+    segments, current = [], []
+    for _, code in extract_executable_gcode(gcode_text):
+        match = TOOL_LINE.match(code)
+        if not match or int(match.group(2)) >= SIDE_MARKER_MIN:
+            current.append(code)
+            continue
+        if current and current[-1].upper() == TOOL_SYNC:
+            current.pop()
+        if current:
+            segments.append({'kind': 'gcode', 'lines': current})
+            current = []
+        channel, value = match.group(1).upper(), int(match.group(2))
+        segments.append({'kind': 'tool', 'lines': [TOOL_SYNC, code],
+                         'address': TOOL_ADDRESS[channel], 'value': value,
+                         'command': f"{channel}{value}"})
+    if current:
+        segments.append({'kind': 'gcode', 'lines': current})
+    return segments
+
+
+def _job_still_active(job_id):
+    if not job_id:
+        return True
+    with direct_job_lock:
+        return bool((state.get('direct_jobs', {}).get(job_id) or {}).get('active'))
+
+
+def _mqtt_reported(percent, since):
+    """Whether the printer has reported this M73 percent since `since`."""
+    _, progress = current_mqtt_progress()
+    return (not progress.get('stale')
+            and (progress.get('last_update') or 0) >= since
+            and str(progress.get('percent')) == str(percent)
+            and progress.get('remaining_time') in (0, None))
+
+
+def send_sub_batch(lines, serial, percent, timeout, single_call, job_id):
+    """Send one batch and wait for either of its done markers.
+
+    `serial` is (address or None, value) as the board will report it.
+    Returns ('serial' | 'mqtt' | None, seconds); None when neither came
+    back within the timeout, the send failed, or the job was aborted.
+    """
+    sent_at = time.time()
+    if not _send_segment_lines(lines, single_call):
+        return None, 0.0
+    deadline = sent_at + timeout
+    while _job_still_active(job_id):
+        with board_mark_cond:
+            at = _find_board_mark(serial[0], serial[1], sent_at)
+            if at is not None:
+                return 'serial', round(at - sent_at, 3)
+            board_mark_cond.wait(0.05)
+        if _mqtt_reported(percent, sent_at):
+            # The serial report comes milliseconds after execution, the MQTT
+            # one 1-2 s after, so one not in by now is lost, not late.
+            with board_mark_cond:
+                at = _find_board_mark(serial[0], serial[1], sent_at)
+            if at is not None:
+                return 'serial', round(at - sent_at, 3)
+            return 'mqtt', round(time.time() - sent_at, 3)
+        if time.time() >= deadline:
+            break
+    return None, round(time.time() - sent_at, 3)
+
+
+def _send_segment_lines(lines, single_call):
+    """Send lines as one publish or one per line, as the job asked."""
+    for line in lines:
+        add_to_history(line)
+    if single_call:
+        return send_gcode_lines_to_printer(lines)
+    ok = True
+    for line in lines:
+        ok = send_gcode_to_printer(line) and ok
+        time.sleep(0.05)
+    return ok
+
+
+def run_tool_batches(job_id, segments, single_call, start_state, wait_for_motion):
+    """Send a job's batches one after another, each once the one before is done.
+
+    Runs on the send queue's worker. Completes the job itself when the last
+    batch is done; the job carries no markers of its own for the matchers.
+    """
+    motion = start_state
+    errors, source, queued = [], None, 0
+    try:
+        for segment in segments:
+            if not _job_still_active(job_id):
+                print(f"Direct job {(job_id or 'untracked')[:8]}: stopped sending, job no longer active")
+                return      # aborted: the e-stop already finished the job
+            percent = next_marker_percent()
+            mqtt_line = f"M73 P{percent} R0"
+            if segment['kind'] == 'gcode':
+                sim = simulate_gcode('\n'.join(segment['lines']), motion)
+                motion = sim.end
+                code = next_side_marker_block()[0]
+                sync = [TOOL_SYNC] if wait_for_motion else []
+                lines = segment['lines'] + sync + [f"M620 R{code} M621 R{code}", mqtt_line]
+                source, took = send_sub_batch(lines, (None, code), percent,
+                                              direct_job_timeout_seconds(sim.seconds), single_call, job_id)
+                queued += len(lines)
+                if source is None:
+                    errors.append(f"No done marker for a {len(segment['lines'])}-line batch after {took}s")
+                    break
+                continue
+            for attempt in range(1, TOOL_MAX_ATTEMPTS + 1):
+                lines = segment['lines'] + [mqtt_line]
+                source, took = send_sub_batch(lines, (segment['address'], segment['value']), percent,
+                                              DIRECT_JOB_MIN_TIMEOUT_SECONDS, True, job_id)
+                queued += len(lines)
+                if source == 'serial':
+                    _log_tool_event('confirmed', segment, attempt=attempt, latency=took)
+                    if attempt > 1:
+                        with board_mark_cond:
+                            tool_stats['resent_ok'] += 1
+                    break
+                if source == 'mqtt':
+                    _log_tool_event('missed', segment, attempt=attempt, waited=took)
+                    percent = next_marker_percent()
+                    mqtt_line = f"M73 P{percent} R0"
+                    continue
+                if _job_still_active(job_id):
+                    _log_tool_event('failed', segment, attempt=attempt, reason=f'no done marker after {took}s')
+                break
+            if source != 'serial':
+                if source == 'mqtt':
+                    _log_tool_event('failed', segment, attempt=TOOL_MAX_ATTEMPTS,
+                                    reason='still missing after resends')
+                errors.append(f"Tool command {segment['command']} not confirmed")
+                break
+    except Exception as e:
+        errors.append(f"Batch sender crashed: {e}")
+    finally:
+        if errors:
+            print(f"Direct job {(job_id or 'untracked')[:8]} stopped: {'; '.join(errors)}")
+        if job_id is not None and _job_still_active(job_id):
+            mark_direct_job_queued(job_id, queued, errors)
+            if not errors:
+                at = time.time()
+                with direct_job_lock:
+                    job = state['direct_jobs'].get(job_id)
+                    if job and job.get('active'):
+                        job['detect_source'] = 'side-channel' if source == 'serial' else source
+                        job['detect_seconds'] = round(at - job['started_at'], 3)
+                        _finish_direct_job(job, 'complete', f'All batches done (last via {source})', completed_at=at)
+                        head.commit(job_id, at=at)
+
+
+def _send_direct_lines(executable_lines, marker_lines, single_call, job_id):
+    """Send a job with no tool commands. Returns (sent, queued, payload_bytes, errors)."""
+    if not _job_still_active(job_id):
+        return 0, 0, 0, []
+    sent_count = queued_count = payload_bytes = 0
     errors = []
-    direct_job = None
-    if state['printer_connected'] and progress_info.get('enabled'):
-        direct_job = begin_direct_job(progress_info)
-
-    executable_lines = list(extract_executable_gcode(gcode_to_send))
-    payload_bytes = 0
-    # Which of the lines about to be queued are our own done markers. Matched
-    # exactly, not by command prefix: the side-channel marker is an M620, and
-    # the user's G-code legitimately contains M620s of its own for the laser.
-    marker_lines = set(progress_info.get('marker_lines') or ())
-
     if single_call:
         # Ship every line in a single MQTT gcode_line command instead of one
         # publish per line.
@@ -2029,13 +2330,9 @@ def queue_direct_gcode(gcode_text: str, single_call: bool = False, progress_mark
                 errors.append(f"Failed to send {queued_count} lines in one call")
     else:
         for line_num, line in executable_lines:
-            # Add to history
             add_to_history(line)
-
-            # Send to printer if connected
             if state['printer_connected']:
-                success = send_gcode_to_printer(line)
-                if not success:
+                if not send_gcode_to_printer(line):
                     errors.append(f"Line {line_num}: Failed to send")
 
             queued_count += 1
@@ -2043,18 +2340,104 @@ def queue_direct_gcode(gcode_text: str, single_call: bool = False, progress_mark
                 sent_count += 1
             time.sleep(0.05)  # Small delay between commands
 
-    if direct_job:
-        direct_job = mark_direct_job_queued(direct_job['id'], queued_count, errors)
-    if not errors:
-        if direct_job and direct_job.get('active'):
-            # Tracked job: the head tracker commits it when its marker arrives.
-            head.apply(gcode_to_send, job_id=direct_job['id'], queued_at=direct_job.get('queued_at'))
-        else:
-            # No done signal to wait for (markers off or printer offline):
-            # assume it executes right away.
-            head.apply(gcode_to_send)
+    if job_id is not None:
+        mark_direct_job_queued(job_id, queued_count, errors)
+    return sent_count, queued_count, payload_bytes, errors
 
-    return {
+
+def queue_direct_gcode(gcode_text: str, single_call: bool = False, progress_markers: bool = True,
+                       wait_for_motion: bool = True, timeout_seconds: float = None):
+    """Queue G-code on the printer as a tracked direct job.
+
+    Returns the same dict the send-all endpoint reports. When progress
+    markers are on and the printer is connected, the returned 'direct_job'
+    can be followed to completion with wait_for_direct_job(). The head
+    tracker simulates the batch from wherever the queued G-code leaves the
+    head, and commits it when the done marker arrives. timeout_seconds
+    replaces the stall timeout worked out from the estimate.
+
+    The G-code goes through the send queue, so it never overtakes or
+    interleaves with anything submitted before it. With nothing ahead it is
+    sent before this returns, as it always was. Otherwise the job is
+    returned in 'queueing' and goes out when its turn comes.
+    """
+    progress_info = {
+        'enabled': False,
+        'command_count': sum(1 for _ in extract_executable_gcode(gcode_text)),
+        'marker_value': None,
+        'estimated_seconds': round(estimate_gcode_seconds(gcode_text), 1),
+        'timeout_seconds': 0.0,
+    }
+    # Tool commands become laser board commands before anything else looks
+    # at the G-code, so history, the head tracker and the done markers all
+    # see what is actually sent.
+    gcode_text, tool_counts = translate_tool_gcode(gcode_text)
+    if tool_counts['laser'] or tool_counts['servo']:
+        print(f"Translated {tool_counts['laser']} laser and {tool_counts['servo']} "
+              f"servo command(s) into laser board commands")
+
+    segments = split_tool_batches(gcode_text)
+    tool_segments = sum(1 for s in segments if s['kind'] == 'tool')
+    split = bool(tool_segments and state['printer_connected'] and side_channel_ready())
+    if tool_segments and state['printer_connected'] and not split:
+        print(f"Laser board not connected: {tool_segments} tool command(s) sent unconfirmed")
+
+    gcode_to_send = gcode_text
+    if split:
+        # Sent as a run of batches, each with its own markers; the job has
+        # none of its own and is completed by run_tool_batches.
+        progress_info = dict(progress_info, enabled=True, marker_field=MARKER_FIELD,
+                             side_marker_values=None, marker_lines=[], batches=len(segments),
+                             timeout_seconds=round(direct_job_timeout_seconds(progress_info['estimated_seconds']), 1))
+    elif progress_markers:
+        gcode_to_send, progress_info = add_completion_marker(gcode_text, wait_for_motion=wait_for_motion)
+    if timeout_seconds and progress_info.get('enabled'):
+        progress_info['timeout_seconds'] = round(float(timeout_seconds), 1)
+
+    direct_job = None
+    if state['printer_connected'] and progress_info.get('enabled'):
+        direct_job = begin_direct_job(progress_info)
+    job_id = direct_job['id'] if direct_job else None
+
+    # The head tracker is updated in submission order, here, so whatever is
+    # submitted next plans from where this job leaves the head (and in the
+    # G90/G91 mode it leaves) even while this one is still waiting to send.
+    # A tracked job is committed when its marker arrives; anything else is
+    # assumed to execute right away.
+    start_state = head.target_state()
+    head.apply(gcode_to_send, job_id=job_id)
+
+    # Which of the lines about to be queued are our own done markers. Matched
+    # exactly, not by command prefix: the side-channel marker is an M620, and
+    # the user's G-code legitimately contains M620s of its own for the laser.
+    marker_lines = list(progress_info.get('marker_lines') or ())
+    executable_lines = list(extract_executable_gcode(gcode_to_send))
+    planned = {
+        'sent_count': len(executable_lines) - len(marker_lines),
+        'queued_count': len(executable_lines),
+        'payload_bytes': len('\n'.join(l for _, l in executable_lines).encode('utf-8')) if single_call else 0,
+    }
+
+    if split:
+        # Never inline: the batches go out one after another as each is
+        # done, which takes as long as the job's motion, and the caller
+        # follows the job instead.
+        send_queue.submit(lambda: run_tool_batches(job_id, segments, single_call, start_state,
+                                                   wait_for_motion), inline=False)
+        ran, outcome = False, None
+    else:
+        ran, outcome = send_queue.submit(
+            lambda: _send_direct_lines(executable_lines, set(marker_lines), single_call, job_id))
+
+    if ran:
+        sent_count, queued_count, payload_bytes, errors = outcome
+    else:
+        sent_count, queued_count, payload_bytes, errors = (
+            planned['sent_count'], planned['queued_count'], planned['payload_bytes'], [])
+    if job_id:
+        with direct_job_lock:
+            direct_job = dict(state['direct_jobs'].get(job_id) or direct_job)
+    result = {
         'success': len(errors) == 0,
         'sent_count': sent_count,
         'queued_count': queued_count,
@@ -2062,9 +2445,13 @@ def queue_direct_gcode(gcode_text: str, single_call: bool = False, progress_mark
         'payload_bytes': payload_bytes,
         'progress': progress_info,
         'direct_job': direct_job,
-        'job_id': direct_job['id'] if direct_job else None,
-        'errors': errors
+        'job_id': job_id,
+        'errors': errors,
     }
+    if tool_segments:
+        result['tool_commands'] = tool_segments
+        result['tool_confirmation'] = split
+    return result
 
 
 def wait_for_direct_job(job_id: str, poll_seconds: float = 0.02, stop_event=None, timeout: float = None):
@@ -2088,7 +2475,6 @@ def wait_for_direct_job(job_id: str, poll_seconds: float = 0.02, stop_event=None
             return job
         _, mqtt_progress = current_mqtt_progress()
         update_direct_job_from_mqtt(mqtt_progress)
-        check_side_channel_watchdog()
         time.sleep(poll_seconds)
 
 
@@ -2105,28 +2491,41 @@ def send_all_gcode():
     # wait=true blocks until the job completes, stalls, or wait_seconds pass
     # (default: the job's own timeout plus a margin) and returns the final job.
     wait = bool(data.get('wait', False))
+    # timeout_seconds overrides how long the job may run before it counts as
+    # stalled (default: estimate x DIRECT_JOB_TIMEOUT_FACTOR + pad).
+    try:
+        timeout_seconds = float(data.get('timeout_seconds') or 0) or None
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'timeout_seconds must be a number'}), 400
 
     if not gcode_text.strip():
         return jsonify({'success': False, 'error': 'No G-code to send'}), 400
 
     result = queue_direct_gcode(gcode_text, single_call=single_call, progress_markers=progress_markers,
-                                wait_for_motion=wait_for_motion)
+                                wait_for_motion=wait_for_motion, timeout_seconds=timeout_seconds)
     if wait and result.get('job_id'):
         try:
             wait_seconds = float(data.get('wait_seconds') or 0) or None
         except (TypeError, ValueError):
             wait_seconds = None
-        if wait_seconds is None:
-            job = result['direct_job'] or {}
-            wait_seconds = (job.get('deadline') or time.time() + DIRECT_JOB_MIN_TIMEOUT_SECONDS) - time.time() + 5.0
+        job = result['direct_job'] or {}
+        if wait_seconds is None and not job.get('deadline'):
+            # Still waiting to send, or still sending: the sender ends the
+            # job one way or the other, and the stall check takes over once
+            # it is queued.
+            timeout = None
+        else:
+            if wait_seconds is None:
+                wait_seconds = (job.get('deadline') or time.time() + DIRECT_JOB_MIN_TIMEOUT_SECONDS) - time.time() + 5.0
+            timeout = max(0.0, wait_seconds)
         t0 = time.perf_counter()
-        job = wait_for_direct_job(result['job_id'], timeout=max(0.0, wait_seconds)) or result['direct_job']
+        job = wait_for_direct_job(result['job_id'], timeout=timeout) or result['direct_job']
         result['direct_job'] = {k: v for k, v in job.items() if k != 'reports'}
         result['completed'] = job.get('status') == 'complete'
         result['waited_seconds'] = round(time.perf_counter() - t0, 3)
         result['success'] = result['success'] and result['completed']
         if job.get('active'):
-            result['error'] = f"Still running after {wait_seconds:.0f}s wait"
+            result['error'] = f"Still running after {result['waited_seconds']:.0f}s wait"
         elif job.get('status') != 'complete':
             result['error'] = job.get('message')
     return jsonify(result)

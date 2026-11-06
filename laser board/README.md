@@ -90,6 +90,20 @@ the moves ahead of it finish: a command behind a 3 s move reached the board
 0.2 s after sending without `M400`, and 3.2 s with it. The translation adds
 the sync for you, so the head pauses briefly at every switch.
 
+With the board plugged in, every tool command is confirmed. G-code with
+tool commands in it is split at each one and sent as a run of batches, one
+after another, each sent only once the one before it is done: moves, then a
+servo move, then more moves is three batches. Every batch ends with two done
+markers, a serial one for the board and an `M73` for MQTT. A tool batch is
+`M400`, the command, and the `M73`; the board's echo of the command is its
+serial marker. If the `M73` comes back (1-2 s) and the echo never did, the
+command was lost on the bus and the batch is sent again, up to 4 tries. If
+neither comes back, the job stops there. Each extra batch costs about 0.2 s.
+Jogs and jobs sent while one is still going out wait their turn behind it;
+the API calls return straight away as usual. Every confirmation, miss and
+failure is appended to `~/.bambucuts.tool-commands.log` (one JSON line each)
+and counted under `tool_commands` in `/api/status`.
+
 Servo moves are eased in and out over 0.33 s. The light has an auto-off
 watchdog: it switches off 60 s after the last power command, so one `M3`
 holds it for at most a minute. For a longer exposure, repeat the `M3` within

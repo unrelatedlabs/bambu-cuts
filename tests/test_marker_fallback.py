@@ -1,4 +1,4 @@
-"""Side-channel-only markers plus lazy MQTT fallback, no hardware."""
+"""Every batch carries both done markers; whichever arrives first completes it. No hardware."""
 import sys, time
 import os, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -43,92 +43,60 @@ def mqtt_says(percent):
     _, prog = A.current_mqtt_progress()
     A.update_direct_job_from_mqtt(prog)
 
-print("board connected: no M73 goes out at all")
+print("board connected: both markers go out with the batch")
 reset()
 text, info, jid = start()
 tail = text.strip().split("\n")[1:]
 print("      " + " | ".join(tail))
-check("M620 side marker present", any("M620" in l for l in tail))
-check("no M73 anywhere in the batch", "M73" not in text, text)
-check("job has no MQTT marker yet", job(jid)['marker_value'] is None)
-check("fallback not yet sent", job(jid)['fallback_sent'] is False)
+code = [strip for strip in (A.strip_inline_comment(l) for l in tail) if strip]
+check("M400, then the serial marker, then the MQTT marker",
+      code[0] == 'M400' and code[1].startswith('M620 R') and code[2].startswith('M73 P'), str(code))
+check("job expects both", job(jid)['side_marker_values'] and job(jid)['marker_value'] is not None)
 
-print("\nhappy path: side marker completes it, still no M73 ever sent")
+print("\nserial marker arrives first: completes on it, nothing else sent")
 A.update_direct_job_from_marker(int(info['side_marker_values'][0]), time.time(), address=1)
 check("complete via side channel", job(jid)['status'] == 'complete'
       and job(jid)['detect_source'] == 'side-channel', str(job(jid).get('detect_source')))
 check("nothing extra sent to the printer", sent == [], str(sent))
 
-print("\nport closes mid-job: fallback injected, job completes on MQTT")
+print("\nserial marker lost: the M73 in the batch completes it")
+reset()
+_, info, jid = start()
+mqtt_says(job(jid)['marker_value'])
+check("complete via MQTT", job(jid)['status'] == 'complete'
+      and job(jid)['detect_source'] == 'mqtt', str(job(jid).get('detect_source')))
+check("nothing injected", sent == [], str(sent))
+
+print("\nport closes mid-job: nothing to inject, the M73 is already on its way")
 reset()
 _, info, jid = start()
 A._handle_marker_lost('marker port closed')
-check("M400 + M73 injected", len(sent) == 1 and sent[0][0] == 'M400'
-      and sent[0][1].startswith('M73 P'), str(sent))
-check("fallback recorded on the job", job(jid)['fallback_sent'] is True
-      and job(jid)['marker_value'] is not None)
-check("reason recorded", job(jid).get('fallback_reason') == 'marker port closed',
-      str(job(jid).get('fallback_reason')))
+check("nothing sent", sent == [], str(sent))
 mqtt_says(job(jid)['marker_value'])
-check("completes on the injected marker", job(jid)['status'] == 'complete'
-      and job(jid)['detect_source'] == 'mqtt', str(job(jid).get('detect_source')))
+check("completes on MQTT", job(jid)['status'] == 'complete', job(jid)['status'])
 
-print("\nsequence gap triggers the same fallback")
-reset()
-_, info, jid = start()
-A._handle_marker_lost('sequence gap: 1 marker(s) lost between seq 4 and 6')
-check("fallback injected on a gap", len(sent) == 1 and job(jid)['fallback_sent'])
-
-print("\nno double injection when triggered twice")
-reset()
-_, info, jid = start()
-A._handle_marker_lost('port closed')
-A._handle_marker_lost('port closed again')
-A.check_side_channel_watchdog()
-check("exactly one fallback sent", len(sent) == 1, str(sent))
-
-print("\nwatchdog injects once the marker is overdue")
-reset()
-_, info, jid = start()
-A.check_side_channel_watchdog()
-check("nothing injected while still within grace", sent == [], str(sent))
-with A.direct_job_lock:                      # backdate past estimate + grace
-    j = A.state['direct_jobs'][jid]
-    j['queued_at'] -= (j['estimated_seconds'] + A.SIDE_CHANNEL_GRACE_SECONDS + 0.5)
-A.check_side_channel_watchdog()
-check("injected once overdue", len(sent) == 1 and sent[0][1].startswith('M73 P'), str(sent))
-mqtt_says(job(jid)['marker_value'])
-check("job completes", job(jid)['status'] == 'complete', job(jid)['status'])
-
-print("\nseveral jobs in flight: one injected marker covers them all")
+print("\nseveral jobs in flight: each has its own percent")
 reset()
 _, i1, j1 = start("G1 X20 Y20")
 _, i2, j2 = start("G1 X30 Y30")
-A._handle_marker_lost('port closed')
-check("one marker for both jobs", len(sent) == 1, str(sent))
-check("both claimed", job(j1)['fallback_sent'] and job(j2)['fallback_sent'])
-check("both share the marker value", job(j1)['marker_value'] == job(j2)['marker_value'])
+check("different percents", job(j1)['marker_value'] != job(j2)['marker_value'],
+      f"{job(j1)['marker_value']} {job(j2)['marker_value']}")
 mqtt_says(job(j2)['marker_value'])
-check("both complete", job(j1)['status'] == 'complete' and job(j2)['status'] == 'complete',
+check("the later marker completes both", job(j1)['status'] == 'complete' and job(j2)['status'] == 'complete',
       f"{job(j1)['status']}/{job(j2)['status']}")
 
-print("\nboard absent: M73 goes out with the batch exactly as before")
+print("\nboard absent: only the M73")
 reset(board=False)
 text, info, jid = start()
 check("M73 in the batch", info['marker_line'] and info['marker_line'] in text)
 check("no M620", "M620" not in text)
-check("already covered, watchdog is a no-op", job(jid)['fallback_sent'] is True)
-A.check_side_channel_watchdog()
-check("nothing injected", sent == [], str(sent))
 mqtt_says(info['marker_value'])
 check("completes on MQTT", job(jid)['status'] == 'complete', job(jid)['status'])
 
-print("\nprinter offline: injection declines rather than pretending")
-reset()
-_, info, jid = start()
-A.state['printer_connected'] = False
-check("no marker sent", A.inject_mqtt_fallback('port closed') is None and sent == [], str(sent))
-check("job left uncovered for the stall timeout", job(jid)['fallback_sent'] is False)
+print("\npercents cycle through 1-99 and never repeat back to back")
+seen = [A.next_marker_percent() for _ in range(250)]
+check("all within 1-99", all(1 <= p <= 99 for p in seen), str(sorted(set(seen))[:3]))
+check("no repeats back to back", all(a != b for a, b in zip(seen, seen[1:])))
 
-print("\n" + ("FAILURES: " + ", ".join(fail) if fail else "all fallback checks passed"))
+print("\n" + ("FAILURES: " + ", ".join(fail) if fail else "all marker checks passed"))
 sys.exit(1 if fail else 0)
